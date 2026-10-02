@@ -1,0 +1,12 @@
+.letta/
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+config.local.json
+state/
+*.log
+*.tgz
+.DS_Store
