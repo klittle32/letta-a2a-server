@@ -20,6 +20,26 @@ The outbound tools execute in the server's SDK process, even when the Letta runt
 
 Keep one public server distribution. Preserve the reusable bridge/client separation internally; do not require separate library publication or introduce a plugin framework.
 
+### Effect v4 implementation decision
+
+Kyle approved Effect v4 and its official development-tooling guidance on October 2.
+Use Effect-native configuration, typed errors, services/layers, and scoped resource
+ownership for the application. Keep the official A2A and Letta SDKs as adapters;
+do not replace their protocols or rewrite proven recovery logic just for style.
+Fiber interruption remains distinct from confirmed remote cancellation.
+
+Use Effect 4.0.0 and matching Node platform package, TypeScript 7.0.2, and
+`@effect/tsgo` 0.48.0. The project-local prepare hook patches TypeScript; the
+`@effect/language-service` tsconfig plugin supplies editor and build diagnostics.
+Use one compiler diagnostics path rather than duplicate Oxlint/LSP reporting.
+Enable strict checking, exact optional properties, checked indexed access, and
+verbatim module syntax. Keep supported SDK/Code ranges separate from these pinned
+tooling versions. Verify a floating Effect is actually rejected by the compiler.
+
+References: [v4 devtools](https://effect.website/docs/v4/getting-started/devtools),
+[installation](https://effect.website/docs/v4/getting-started/installation), and
+[Schema compiler settings](https://effect.website/docs/v4/schema/introduction).
+
 ## Lean Docker development
 
 Use Docker for local development, not as a required production dependency. Keep one Dockerfile and one Compose file alongside source, example configuration, a short README, and focused tests. No gateway or OAuth demo stack.

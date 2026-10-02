@@ -1,0 +1,8 @@
+{
+  "agentId": "agent-local-replace-with-an-existing-test-agent",
+  "name": "My Letta Agent",
+  "backend": { "type": "local" },
+  "publicUrl": "http://127.0.0.1:41241/",
+  "port": 41241,
+  "peers": {}
+}
