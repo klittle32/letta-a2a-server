@@ -136,6 +136,44 @@ async function turn(client: Awaited<ReturnType<ClientFactory["createFromUrl"]>>,
   }, { signal: AbortSignal.timeout(limitMs) })));
 }
 
+/** Drain before asserting, so a failed check does not abandon active SDK work. */
+async function streamedToolTurn(client: Awaited<ReturnType<ClientFactory["createFromUrl"]>>, prompt: string, contextId: string) {
+  let taskId = "", answer = "";
+  let artifactUpdates = 0, progressUpdates = 0;
+  let complete = false, singleFinalArtifact = true, sawToolProgress = false;
+  let progressBeforeAnswer = false;
+  for await (const event of client.sendMessageStream({
+    tenant: "", metadata: undefined,
+    message: { ...agentMessage(prompt, "", contextId), role: Role.ROLE_USER },
+    configuration: { returnImmediately: false, acceptedOutputModes: ["text/plain"], historyLength: 0, taskPushNotificationConfig: undefined },
+  }, { signal: AbortSignal.timeout(limitMs) })) {
+    const payload = event.payload;
+    if (payload?.$case === "task") taskId = payload.value.id;
+    if (payload?.$case === "statusUpdate") {
+      const status = payload.value.status;
+      if (status?.state === TaskState.TASK_STATE_WORKING && status.message) {
+        progressUpdates++;
+        const label = status.message.parts.map((part) => part.content?.$case === "text" ? part.content.value : "").join("");
+        if (label.includes("a2a_invoke")) sawToolProgress = true;
+      }
+      if (status?.state === TaskState.TASK_STATE_COMPLETED) complete = true;
+    }
+    if (payload?.$case === "artifactUpdate") {
+      const update = payload.value;
+      artifactUpdates++;
+      singleFinalArtifact &&= !update.append && update.lastChunk === true;
+      progressBeforeAnswer ||= sawToolProgress;
+      answer += update.artifact?.parts.map((part) => part.content?.$case === "text" ? part.content.value : "").join("") ?? "";
+    }
+  }
+  report("streaming", { complete, artifactUpdates, progressUpdates, singleFinalArtifact, sawToolProgress, progressBeforeAnswer });
+  assert(taskId && complete && artifactUpdates === 1 && singleFinalArtifact && progressBeforeAnswer);
+  const stored = completed(await deadline(client.getTask({ id: taskId, tenant: "", historyLength: 0 })));
+  assert(stored.text === answer && stored.contextId === contextId);
+  report("streaming_readback", { sameAnswer: true, sameContext: true });
+  return stored;
+}
+
 async function main() {
   const check = process.argv[2] === "--check";
   const mode = process.argv[2] ?? process.env.SMOKE_MODE;
@@ -227,7 +265,7 @@ async function main() {
     assert(second.contextId === first.contextId && second.text.includes(recall));
     report(stage, { completed: true, sameContext: true });
     stage = "delegation";
-    const third = await turn(remote, "Call a2a_invoke exactly once with target smoke_peer and message receipt. Report only the token returned by the peer.", first.contextId);
+    const third = await streamedToolTurn(remote, "Call a2a_invoke exactly once with target smoke_peer and message receipt. Report only the token returned by the peer.", first.contextId);
     if (endpoint.receipts.length !== 1 || !third.text.includes(endpoint.nonce)) report("delegation_mismatch", {
       peerReceipts: endpoint.receipts.length,
       sameContext: third.contextId === first.contextId,

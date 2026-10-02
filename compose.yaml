@@ -1,60 +1,49 @@
 name: letta-a2a-server-dev
+
+x-server: &server
+  build: .
+  image: letta-a2a-server:dev
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:41241/healthz').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1));"]
+    interval: 30s
+    timeout: 5s
+    start_period: 30s
+    retries: 3
+
 services:
   server:
-    build: .
-    init: true
+    <<: *server
     ports:
-      - "127.0.0.1:${A2A_PORT:-41241}:41241"
+      - "127.0.0.1:41241:41241"
     environment:
       A2A_LISTEN_HOST: "0.0.0.0"
-      BUN_INSTALL_CACHE_DIR: /home/node/.cache/bun
-      npm_config_cache: /home/node/.cache/npm
+      LETTA_API_KEY: "${LETTA_API_KEY:-}"
     volumes:
       - type: bind
-        source: ./src
-        target: /app/src
-        read_only: true
-        bind: { create_host_path: false }
-      - type: bind
-        source: ./tests
-        target: /app/tests
-        read_only: true
-        bind: { create_host_path: false }
-      - type: bind
-        source: ./scripts
-        target: /app/scripts
-        read_only: true
-        bind: { create_host_path: false }
-      - type: bind
-        source: ./package.json
-        target: /app/package.json
-        read_only: true
-        bind: { create_host_path: false }
-      - type: bind
-        source: ./package-lock.json
-        target: /app/package-lock.json
-        read_only: true
-        bind: { create_host_path: false }
-      - type: bind
-        source: ./tsconfig.json
-        target: /app/tsconfig.json
-        read_only: true
-        bind: { create_host_path: false }
-      - type: bind
-        source: ./tsconfig.build.json
-        target: /app/tsconfig.build.json
-        read_only: true
-        bind: { create_host_path: false }
-      - type: bind
-        source: ${A2A_CONFIG_FILE:-./config.example.json}
+        source: ${A2A_CONFIG_FILE:-./config.cloud.local.json}
         target: /app/config.local.json
         read_only: true
         bind: { create_host_path: false }
-      - dependencies:/app/node_modules
+      - cloud-runtime:/home/node/.letta
+
+  local:
+    <<: *server
+    ports:
+      - "127.0.0.1:41242:41241"
+    environment:
+      A2A_LISTEN_HOST: "0.0.0.0"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    volumes:
+      - type: bind
+        source: ${A2A_LOCAL_CONFIG_FILE:-./config.local.json}
+        target: /app/config.local.json
+        read_only: true
+        bind: { create_host_path: false }
       - runtime:/home/node/.letta
-      - cache:/home/node/.cache
-    command: ["npm", "run", "dev"]
+
 volumes:
-  dependencies:
+  cloud-runtime:
   runtime:
-  cache:

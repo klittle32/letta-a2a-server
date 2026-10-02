@@ -44,9 +44,10 @@ References: [v4 devtools](https://effect.website/docs/v4/getting-started/devtool
 
 Use Docker for local development, not as a required production dependency. Keep one Dockerfile and one Compose file alongside source, example configuration, a short README, and focused tests. No gateway or OAuth demo stack.
 
-- Bind-mount source for development; keep dependencies, caches, and runtime state in Docker volumes. Secrets stay in an ignored `.env`, and only explicitly needed credentials enter containers. Do not mount the host's entire Letta home or authentication directory.
+- Kyle's October 2 startup correction makes `docker compose up -d` the ordinary operating path. Build dependencies and the compiled application into the image; rebuild after edits rather than hot-mounting the checkout. Keep backend runtime state in separate volumes. Secrets stay in an ignored `.env`, and only the explicitly needed credential enters each service. Do not mount the host's entire Letta home or authentication directory.
 - Publish development ports on host loopback only. The container may listen on its own network interface without making the service publicly accessible.
 - SDK `local` mode runs inside the container. Connecting to the Mac's existing App Server uses `remote` mode; Cloud mode remains a separate configuration. Document this distinction.
+- SDK-local `harnessBackend: "api"` also runs inside the container, but uses Cloud agent state and models. The ordinary Compose pair uses this native option for its Cloud-backed service and `harnessBackend: "local"` for its local-state service. Provision dedicated test identities once; normal server startup continues to bind explicit IDs only.
 - Reuse a compact set of regression checks for retained behavior and one small direct-boundary smoke test. Use two configured agents to exercise isolation and bidirectional communication; do not import the lab's complete integration harness.
 - Keep generated logs, reports, test artifacts, dependencies, build output, and local state out of Git. No evidence bundles, verifier frameworks, or elaborate release machinery.
 - Start without live credentials using deterministic checks. Live runtime verification uses explicitly selected test agents and reports unavailable prerequisites rather than quietly borrowing production identities.
@@ -92,6 +93,7 @@ Current registry observations, not verified compatibility: SDK `0.8.28`, Code `0
 - Reuse the SDK adapter for outbound calls, binding tools to the actual ready conversation and awaiting their cleanup. Preserve bounded calls, cancellation propagation, and credential/destination restrictions.
 - Default the first quick start to loopback. Use a small independent A2A test peer, not a gateway stack.
 - Preserve the current text-only A2A 1.0 JSON-RPC/SSE profile and existing lifecycle semantics. Cards advertise only enabled capabilities; push callbacks are not mandatory.
+- October 2 approved streaming refinement: publish safe, observed activity as standard working-status messages, then one complete final answer artifact. Do not forward assistant token deltas or private reasoning/tool payloads. Keep failure, cancellation, and input/authentication-required outcomes distinct. This changes output presentation, not the transport or execution-ownership rules.
 
 **Done when:** an independent A2A client discovers the agent, sends a message, continues its context, and asks it to call a configured peer and return the result. No agentgateway, LiteLLM, Docker lab, global mod, or auto-created agent is required.
 

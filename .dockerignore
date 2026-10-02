@@ -1,3 +1,13 @@
 **
 !Dockerfile
 !.dockerignore
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.build.json
+!src/
+!src/**
+!tests/
+!tests/**
+!scripts/
+!scripts/**

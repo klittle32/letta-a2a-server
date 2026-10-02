@@ -101,6 +101,17 @@ describe("server configuration", () => {
     expect(() => sdkOptions(config.backend, { APP_SERVER_TOKEN: " \t" })).toThrow("APP_SERVER_TOKEN");
   });
 
+  test("Cloud-backed agents can execute in the local SDK runtime", () => {
+    for (const harnessBackend of ["api", "local"] as const) {
+      const config = parseConfig({ ...base, backend: { type: "local", harnessBackend } });
+      expect(sdkOptions(config.backend, {})).toEqual({
+        backend: "local", appServer: { harnessBackend, pinGlobalAgent: false },
+      });
+    }
+    expect(() => parseConfig({ ...base, backend: { type: "local", harnessBackend: "cloud" } })).toThrow();
+    expect(() => parseConfig({ ...base, backend: { type: "cloud", harnessBackend: "api" } })).toThrow();
+  });
+
   test("Cloud execution selection is independent of agent identity", () => {
     const config = parseConfig({ ...base, backend: {
       type: "cloud", apiKeyEnv: "TEST_LETTA_KEY", computer: { deviceId: "device-test" },

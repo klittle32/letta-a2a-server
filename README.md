@@ -14,71 +14,131 @@ signals and finalization. The official A2A SDK still owns protocol handling;
 the Letta SDK owns agent execution. Their Promise-based adapters retain the
 existing task ownership and uncertain-cancellation safeguards.
 
-## Docker development
+## Run with Docker Compose
+
+After the one-time configuration below:
 
 ```sh
-docker compose build
-docker compose run --rm server npm ci
-docker compose run --rm server npm test
-docker compose run --rm server npm run check
-docker compose run --rm server npm run build
-cp config.example.json config.local.json
-# Set the ID of an existing test agent and its backend in config.local.json.
-export A2A_CONFIG_FILE=./config.local.json
-docker compose up
+docker compose up -d
+docker compose ps
 ```
 
-Only `src/`, `tests/`, `scripts/`, the package manifest/lockfile, both TypeScript
-configs, and the selected nonsecret configuration file are bind-mounted, all read-only. Source
-edits remain visible for hot reload; tests see host edits too. The whole checkout,
-`.env`, `.git`, `.letta`, and host credentials are **not** mounted. Keep secrets out
-of these selected inputs. Dependencies, cache, and isolated Letta state use named
-volumes. Build output stays in the container; build and use it in the same run.
+| Service | Host endpoint | Agent state | Harness and tools |
+| --- | --- | --- | --- |
+| `server` | `http://127.0.0.1:41241/` | Letta Cloud | Inside Docker |
+| `local` | `http://127.0.0.1:41242/` | Docker `runtime` volume | Inside Docker |
 
-Without `A2A_CONFIG_FILE`, Compose mounts `config.example.json` as
-`/app/config.local.json`, so installation/checks require no local config file.
-A missing explicitly selected file fails instead of creating a host directory.
-Recreate the service after config edits (`docker compose up --force-recreate`).
-The default example cannot start a real agent until its placeholder is replaced.
+The ordinary compiled server runs in both containers. It reconnects to explicit
+agent IDs; startup never creates, reconfigures, or deletes agents. There is no
+temporary launcher or automatic provisioning loop. The two-service setup does
+not yet implement several bindings inside one server process.
 
-The service publishes only `127.0.0.1:41241`; advertised URLs must likewise use
-`127.0.0.1`, not IPv6 or `localhost`. For a different published port, set `A2A_PORT`
-and the config's `publicUrl` port together; the internal `port` can remain 41241.
-The container network itself is trusted: do not connect untrusted containers or
-expose its port publicly. `docker compose down` preserves volumes.
+Send messages from the host using the Go `a2a` CLI:
 
-The example ID is a placeholder. Startup verifies the configured existing agent;
-it never creates an agent, changes its model, or replaces its tools or memory.
+```sh
+a2a --endpoint http://127.0.0.1:41241/ --transport jsonrpc --timeout 120s send "Hello"
+a2a --endpoint http://127.0.0.1:41242/ --transport jsonrpc --timeout 120s send "Hello"
+```
+
+To see progress while waiting for one complete answer:
+
+```sh
+a2a --endpoint http://127.0.0.1:41241/ --transport jsonrpc --timeout 120s send --stream "Read /app/package.json and tell me the project name."
+```
+
+Use port `41242` for the local backend. The stream carries safe activity updates,
+then the complete answer once—not words or tokens on separate lines. The Go CLI
+labels activity `[status]` and the final answer `[artifact]`; “artifact” is the
+protocol's output/result container, not necessarily a file. Add `--output jsonl`
+to inspect the standard A2A events instead of the CLI's text rendering.
+
+Use `--output json` for task details. Continue a conversation by passing its
+`task.contextId` with `send --context-id ID`. Agent identity and memory persist,
+but the current A2A task/context mappings are in memory and reset on service
+restart; start a new A2A context after restarting.
+
+```sh
+docker compose logs -f              # Follow both services
+docker compose restart             # Restart without deleting agents or state
+docker compose down                # Stop/remove containers; retain volumes
+docker compose up -d --build        # Rebuild after source/dependency changes
+```
+
+Do not use `down -v` unless you intend to erase local agent state. Both published
+ports are host-loopback only; the container network is trusted. There is no public
+hosting authentication in this slice.
+
+### One-time configuration for a fresh checkout
+
+Put `LETTA_API_KEY` and `OPENAI_API_KEY` in the ignored project-root `.env`.
+Compose automatically passes **only** the Letta key to `server` and **only** the
+OpenAI key to `local`; no shell exports or `.env` mounts are needed. Environment
+variables already exported in your shell take precedence over `.env`.
+
+```sh
+cp config.cloud.example.json config.cloud.local.json
+cp config.example.json config.local.json
+docker compose build server
+```
+
+Replace each placeholder `agentId` with the existing agent you want to expose.
+For a new dedicated pair, create them once with the native CLI:
+
+```sh
+docker compose run --rm server node_modules/.bin/letta --backend api agents create --name "A2A Compose Cloud" --model openai/gpt-5.4-mini
+docker compose run --rm local node_modules/.bin/letta --backend local agents create --name "A2A Compose Local" --model openai/gpt-5.4-mini
+```
+
+Copy the returned IDs into the matching configuration files, then run
+`docker compose up -d`. Do not repeat creation on each startup. A local-backend
+agent must exist in the `local` service's runtime volume, not your Mac's Letta
+home. Configurations are ignored and mounted read-only; missing files fail
+rather than becoming host directories. `A2A_CONFIG_FILE` and
+`A2A_LOCAL_CONFIG_FILE` can select alternative files.
+
+The image includes dependencies, compiled application, source, tests, and the
+opt-in smoke fixture. `.env`, local configurations, `.git`, and host Letta state
+are excluded from the build context. Rebuild after edits; source is not hot-mounted.
+
+Provider-free checks, with no credentials or state mounted:
+
+```sh
+docker run --rm --network none letta-a2a-server:dev npm test
+docker run --rm --network none letta-a2a-server:dev npm run check
+```
 
 npm 11.17.0 and `package-lock.json` define the installation path; Bun 1.4.2 is
 only the test runner. Docker is optional: with Node >=24.19, npm, and Bun available,
 run `npm ci`, `npm test`, `npm run check`, and `npm run build`, then
 `node dist/main.js config.local.json`. Those commands create ignored local outputs.
+For host-native execution, use an agent available to that host's backend and
+make `publicUrl` match its actual listening port; the Compose local example
+advertises Docker's host-side port mapping instead.
 
 ### Opt-in live smoke test
 
 This is separate from `npm test`: it creates a disposable agent and makes paid
 model calls. Select a model explicitly from the backend's SDK model catalog.
-With the required credential exported in your shell:
 
 ```sh
 # Provider-free check of the independent A2A peer fixture:
-docker compose run --rm server npm run smoke:live -- --check
+docker run --rm --network none letta-a2a-server:dev npm run smoke:live -- --check
 
 # Pass only the credential required by this backend:
-docker compose run --rm -e OPENAI_API_KEY server npm run smoke:live -- local openai/gpt-5.4-mini
-docker compose run --rm -e LETTA_API_KEY server npm run smoke:live -- cloud openai/gpt-5.4-mini
+docker compose run --rm local npm run smoke:live -- local openai/gpt-5.4-mini
+docker compose run --rm server npm run smoke:live -- cloud openai/gpt-5.4-mini
 ```
 
-An ignored `.env` can stay in this worktree. Compose reads it for interpolation
-but does not automatically export its keys into these containers; load the
-selected key into your invoking environment. Do not mount `.env` or put secret
-values in command arguments. Local tests use a fresh temporary HOME. Cloud tests
-use the account's model access and SDK-managed execution, not a connected laptop.
-Neither test uses an existing agent or changes account-level providers.
+Local smoke tests use a fresh temporary HOME. The smoke fixture's `cloud` mode
+tests SDK-managed sandbox execution, unlike the normal Compose `server`, whose
+Cloud-backed agent executes inside Docker. Neither smoke test uses an existing
+agent or changes account-level providers. These are developer checks, not the
+normal interactive usage path.
 
 The test checks real answers, context recall, and a tool call to an independent
-deterministic A2A peer. It prints created/deleted IDs, bounded tool diagnostics,
+deterministic A2A peer. The tool-call turn uses streaming and checks that tool
+progress precedes a single complete answer artifact, followed by matching
+`GetTask` readback. It prints created/deleted IDs, bounded tool diagnostics,
 and cleanup outcomes, not credentials or reasoning traces. Cancellation is not proved by these successful
 turns. Cloud sandbox termination on close is SDK best-effort, not independent
 evidence that the sandbox stopped.
@@ -106,7 +166,7 @@ docker compose run --rm server npx --no-install tsc --version
 ```
 
 Editor integration requires the **workspace** TypeScript version. With Docker-only
-dependencies, a host editor cannot see the dependency volume; use an editor in an
+dependencies, a host editor cannot see the image's dependencies; use an editor in an
 environment with those dependencies, or opt into local `npm ci`, then select the
 workspace compiler. No global editor settings or extensions are changed here.
 The optional Effect debugger extension is separate from the project language
@@ -132,6 +192,15 @@ Local runs an SDK-managed App Server **inside the container**, using its isolate
 Letta state. An agent on your Mac is not automatically available there.
 
 ```json
+{ "type": "local", "harnessBackend": "api" }
+```
+
+This is the default Compose `server` configuration: the SDK-managed App Server
+executes inside Docker but uses Cloud-backed agents and models. `api` is the
+SDK's native name for that state backend. It uses `LETTA_API_KEY` from its
+environment. Set `harnessBackend` to `local`, or omit it, for fully local state.
+
+```json
 { "type": "remote", "url": "http://host.docker.internal:4500", "tokenEnv": "APP_SERVER_TOKEN" }
 ```
 
@@ -149,15 +218,23 @@ uses the SDK's managed-sandbox path. A top-level optional `cwd` refers to that
 runtime's filesystem, not automatically the Docker filesystem. The managed-sandbox
 path has live smoke coverage below; connected-computer execution remains unverified.
 
-Keep secrets in an ignored `.env`. Compose does **not** automatically inject that
-file into the container. Pass only the named secret needed for a command, e.g.
-`docker compose run --rm --service-ports -e LETTA_API_KEY server`, with the value
-exported in your shell. Do not mount your whole host Letta home to borrow auth.
+Keep secrets in the ignored `.env`; Compose explicitly maps the required key per
+service. Other runtime configurations may require another explicit environment
+mapping. Never mount the whole host Letta home to borrow authentication.
 
 ## A2A behavior
 
 - Agent Card: `/.well-known/agent-card.json`; JSON-RPC at `/`; health at `/healthz`.
 - Text-only A2A 1.0 with streaming, task lookup, and context continuation.
+- Streaming reports safe observed activity through standard working-status
+  messages, then publishes one complete answer artifact on success. Progress
+  does not forward reasoning text, raw tool arguments/results, or private runtime errors.
+  “Tool requested” means the SDK observed a call/proposal; it is not proof that
+  permission was granted or execution began.
+  Input/authentication requests remain status messages; failed or uncertain
+  turns do not publish a partial answer as a completed result. This follows the
+  [official progress-then-result example](https://github.com/a2aproject/a2a-samples/blob/6603ba3f2c31a7ef33e70b9d8b5b5f8be42ac9a3/samples/python/agents/langgraph/app/agent_executor.py#L49-L79),
+  using this project's A2A 1.0 SDK rather than copying the Python API.
 - Optional `peers`, such as `{ "helper": "http://peer:41241/" }`, expose
   `a2a_invoke` and `a2a_task` to this server's sessions. Outbound tools execute in
   this server process, including for remote/Cloud runtimes. They are not global
@@ -192,7 +269,7 @@ those fields. `npm ci` passes; registry-integrity metadata repair remains pendin
 Checkpoint (October 2, 2026): Node 24.19.0, Bun 1.4.2, installed SDK 0.8.28,
 SDK-bundled Code 0.34.2, A2A SDK 1.1.0, and the pinned Effect/TypeScript toolchain
 above. Clean Docker `npm ci` patches the compiler successfully; the current suite
-passes 39 tests (211 assertions), Effect-enabled typecheck, and build. Compiled
+passes 51 tests (252 assertions), Effect-enabled typecheck, and build. Compiled
 Node imports also passed at the foundation checkpoint.
 Compiled Node HTTP discovery and two-turn continuity also pass using fake SDK
 sessions, with disposal awaited at scope exit.
@@ -226,6 +303,29 @@ Cloud tests requested a five-minute sandbox TTL and best-effort termination on
 session close; independent sandbox termination was not checked. Hosted runtime
 version was not pinned. Remote App Server, Cloud connected-computer execution,
 and live cancellation remain unverified. Successful turns do not prove cancellation.
+
+The subsequent normal Compose configuration was verified separately with two
+dedicated persistent agents. Host Go `a2a` v0.3.0 completed real messages and
+same-context recall against both published ports, with both harnesses executing
+inside Docker. A Compose restart retained both agent IDs, and new requests passed
+after restart. The built image also passed all provider-free tests with networking
+disabled and contained none of the local configuration or credential files.
+Unlike disposable smoke fixtures, the configured Compose agents are intentionally
+retained when their services stop.
+
+Status-first streaming was checked against both real local and Cloud-managed
+SDK turns using a deterministic outbound peer. The old image failed the new
+check with 23 artifact updates and no progress messages. The revised implementation
+passed with three progress messages before one complete final artifact and
+identical `GetTask` readback; disposable-agent deletion and cleanup passed in both
+modes. Thinking-label and failure-path coverage uses mocked SDK messages; these
+successful live turns do not establish live cancellation behavior or certify SDK
+nested-stream normalization.
+The compiled candidate also passed host Go CLI `send --stream` checks against
+Cloud-backed/Docker and local/Docker agents on temporary ports: one complete
+`[artifact]`, no `[artifact+]` lines, and working/completed statuses. Those checks
+did not replace the normal running Compose containers. Rebuild with
+`docker compose up -d --build` to activate source changes in those services.
 
 Before the Effect migration, npm replaced the stalled Bun installer. Both
 the original npm fallback and clean `npm ci` ran lifecycle scripts, including Code

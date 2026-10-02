@@ -25,7 +25,10 @@ const computer = Schema.Union([
   Schema.Struct({ name: nonEmpty }),
 ]);
 const backend = Schema.Union([
-  Schema.Struct({ type: Schema.Literals(["local"]) }),
+  Schema.Struct({
+    type: Schema.Literals(["local"]),
+    harnessBackend: Schema.optional(Schema.Literals(["api", "local"])),
+  }),
   Schema.Struct({ type: Schema.Literals(["remote"]), url: endpoint, tokenEnv: Schema.optional(envName) }),
   Schema.Struct({ type: Schema.Literals(["cloud"]), apiKeyEnv: Schema.optional(envName), computer: Schema.optional(computer) }),
 ]);
@@ -80,7 +83,12 @@ export function sdkOptions(
     return value;
   };
   switch (config.type) {
-    case "local": return { backend: "local" };
+    case "local": return {
+      backend: "local",
+      ...(config.harnessBackend ? { appServer: {
+        harnessBackend: config.harnessBackend, pinGlobalAgent: false,
+      } } : {}),
+    };
     case "remote": return {
       backend: "remote", url: config.url,
       ...(config.tokenEnv ? { authToken: secret(config.tokenEnv) } : {}),

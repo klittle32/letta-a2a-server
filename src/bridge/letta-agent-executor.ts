@@ -101,8 +101,16 @@ export class LettaAgentExecutor implements AgentExecutor {
     const cancellation = new AbortController();
     this.activeTasks.set(taskId, cancellation);
     this.interrupted.delete(taskId);
-    const artifact = new StreamingTextArtifact(eventBus, taskId, contextId);
+    const artifact = new FinalTextArtifact(eventBus, taskId, contextId);
     const contextKey = this.contextKey(request);
+    let lastActivity: string | undefined;
+    const progress = (activity: string) => {
+      if (cancellation.signal.aborted || activity === lastActivity) return;
+      lastActivity = activity;
+      this.publishTerminal(
+        eventBus, taskId, contextId, TaskState.TASK_STATE_WORKING, activity,
+      );
+    };
     let accepted = false;
     try {
       const initial = this.initialTask(request);
@@ -130,7 +138,9 @@ export class LettaAgentExecutor implements AgentExecutor {
           messageId: userMessage.messageId,
           text,
           signal: cancellation.signal,
-          onAssistantText: (chunk) => artifact.push(chunk),
+          // Assistant deltas are provisional, never public answer artifacts.
+          onAssistantText: () => progress("Generating response"),
+          onActivity: progress,
         });
         if (this.letta.unresolvedContexts?.includes(contextKey))
           throw new Error("Execution requires reconciliation");
@@ -142,8 +152,12 @@ export class LettaAgentExecutor implements AgentExecutor {
             : result.state === "auth_required"
               ? TaskState.TASK_STATE_AUTH_REQUIRED
               : TaskState.TASK_STATE_COMPLETED;
-        successful = !cancellation.signal.aborted;
-        detail = result.detail;
+        successful = state === TaskState.TASK_STATE_COMPLETED;
+        detail = result.detail ?? (
+          result.state === "input_required" || result.state === "auth_required"
+            ? result.text
+            : undefined
+        );
         if (successful) artifact.prepare(result.text);
       } catch (error) {
         this.report(taskId, error);
@@ -178,7 +192,6 @@ export class LettaAgentExecutor implements AgentExecutor {
         );
       }
       if (successful) artifact.finish();
-      else artifact.stop();
       eventBus.publish(terminal);
       const interrupted =
         state === TaskState.TASK_STATE_INPUT_REQUIRED ||
@@ -362,31 +375,20 @@ export class LettaAgentExecutor implements AgentExecutor {
   }
 }
 
-/** One-item lookahead preserves nonfinal partial output on failure/cancellation. */
-class StreamingTextArtifact {
+/** Publish only the settled answer, with the same replacement used by durability. */
+class FinalTextArtifact {
   readonly artifactId = crypto.randomUUID();
-  private readonly chunks: string[] = [];
-  private pending: string | undefined;
-  private started = false;
+  private text: string | undefined;
   constructor(
     private readonly eventBus: ExecutionEventBus,
     private readonly taskId: string,
     private readonly contextId: string,
   ) {}
-  push(text: string): void {
-    if (!text) return;
-    this.flush(false);
-    this.pending = text;
-    this.chunks.push(text);
+  prepare(text: string): void {
+    this.text = text;
   }
-  prepare(fallback: string): void {
-    if (this.pending === undefined && !this.started && fallback) {
-      this.pending = fallback;
-      this.chunks.push(fallback);
-    }
-  }
-  replacement(lastChunk: boolean) {
-    if (!this.chunks.length) return undefined;
+  replacement(successful: boolean) {
+    if (!successful || this.text === undefined) return undefined;
     return AgentEvent.artifactUpdate({
       taskId: this.taskId,
       contextId: this.contextId,
@@ -394,41 +396,17 @@ class StreamingTextArtifact {
         artifactId: this.artifactId,
         name: "Letta response",
         description: "Public assistant text from the Letta turn.",
-        parts: this.chunks.map(textPart),
+        parts: [textPart(this.text)],
         metadata: undefined,
         extensions: [],
       },
       append: false,
-      lastChunk,
+      lastChunk: true,
       metadata: undefined,
     });
   }
   finish(): void {
-    this.flush(true);
-  }
-  stop(): void {
-    this.flush(false);
-  }
-  private flush(lastChunk: boolean): void {
-    if (this.pending === undefined) return;
-    this.eventBus.publish(
-      AgentEvent.artifactUpdate({
-        taskId: this.taskId,
-        contextId: this.contextId,
-        artifact: {
-          artifactId: this.artifactId,
-          name: "Letta response",
-          description: "Public assistant text from the Letta turn.",
-          parts: [textPart(this.pending)],
-          metadata: undefined,
-          extensions: [],
-        },
-        append: this.started,
-        lastChunk,
-        metadata: undefined,
-      }),
-    );
-    this.started = true;
-    this.pending = undefined;
+    const event = this.replacement(true);
+    if (event) this.eventBus.publish(event);
   }
 }

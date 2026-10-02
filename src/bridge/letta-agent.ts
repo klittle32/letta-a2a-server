@@ -19,7 +19,10 @@ export interface LettaTurnRequest {
   messageId: string;
   text: string;
   signal: AbortSignal;
+  /** Legacy provisional-text observer; the executor never publishes its content. */
   onAssistantText(text: string): void;
+  /** Accepts only safe public activity labels, never reasoning or raw tool/error content. */
+  onActivity?(activity: string): void;
 }
 /** Interruption is a trusted, settled runner outcome, never assistant-prose parsing.
  * Returning it guarantees this turn no longer owns active or uncertain execution.
@@ -158,6 +161,14 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
     let sent = false;
     let result: SDKResultMessage | undefined;
     let assistantText = "";
+    let assistantKey: string | undefined;
+    let sawAssistant = false;
+    let lastActivity: string | undefined;
+    const activity = (label: string) => {
+      if (request.signal.aborted || label === lastActivity) return;
+      lastActivity = label;
+      request.onActivity?.(label);
+    };
     try {
       try {
         await using session = known
@@ -189,9 +200,36 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
           await this.policy.execution?.sent?.(request);
           for await (const message of session.stream()) {
             await this.policy.execution?.observe?.(request, message);
+            // Only typed top-level SDK messages are activity evidence. Raw
+            // stream_event envelopes (including internal/nested streams) stay private.
             if (message.type === "assistant") {
+              // 0.8.28 generates app-server-N/cloud-N per delta without a
+              // wire ID. Those are not message boundaries; prefer lineage or
+              // keep accumulating, as the SDK's finalAssistantText does.
+              const key = /^(app-server|cloud)-[0-9]+$/.test(message.uuid)
+                ? (message.otid ?? assistantKey)
+                : message.uuid;
+              if (assistantKey !== key) assistantText = "";
+              assistantKey = key;
+              sawAssistant = true;
               assistantText += message.content;
-              request.onAssistantText(message.content);
+              activity("Generating response");
+            } else if (message.type === "reasoning") {
+              activity("Thinking");
+            } else if (message.type === "tool_call" || message.type === "tool_result") {
+              // Like SDK finalAssistantText, discard pre-tool commentary.
+              assistantText = "";
+              assistantKey = undefined;
+              if (message.type === "tool_call") {
+                const name = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(message.toolName)
+                  ? message.toolName
+                  : undefined;
+                activity(name ? `Tool requested: ${name}` : "Tool requested");
+              } else {
+                activity("Tool finished");
+              }
+            } else if (message.type === "retry") {
+              activity("Retrying request");
             } else if (message.type === "result") result = message;
           }
         } finally {
@@ -223,7 +261,9 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
       throw error;
     }
     if (request.signal.aborted) throw new LettaTurnCancelledError();
-    return { text: assistantText || result.result || "" };
+    // Remote SDK result.result contains ALL assistant messages, not just the
+    // final one. Use it only for transports that emitted no assistant slices.
+    return { text: sawAssistant ? assistantText : (result.result ?? "") };
   }
 
   private async withContextLock<T>(
