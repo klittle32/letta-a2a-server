@@ -28,8 +28,8 @@ export A2A_CONFIG_FILE=./config.local.json
 docker compose up
 ```
 
-Only `src/`, `tests/`, the package manifest/lockfile, both TypeScript configs, and
-the selected nonsecret configuration file are bind-mounted, all read-only. Source
+Only `src/`, `tests/`, `scripts/`, the package manifest/lockfile, both TypeScript
+configs, and the selected nonsecret configuration file are bind-mounted, all read-only. Source
 edits remain visible for hot reload; tests see host edits too. The whole checkout,
 `.env`, `.git`, `.letta`, and host credentials are **not** mounted. Keep secrets out
 of these selected inputs. Dependencies, cache, and isolated Letta state use named
@@ -54,6 +54,34 @@ npm 11.17.0 and `package-lock.json` define the installation path; Bun 1.4.2 is
 only the test runner. Docker is optional: with Node >=24.19, npm, and Bun available,
 run `npm ci`, `npm test`, `npm run check`, and `npm run build`, then
 `node dist/main.js config.local.json`. Those commands create ignored local outputs.
+
+### Opt-in live smoke test
+
+This is separate from `npm test`: it creates a disposable agent and makes paid
+model calls. Select a model explicitly from the backend's SDK model catalog.
+With the required credential exported in your shell:
+
+```sh
+# Provider-free check of the independent A2A peer fixture:
+docker compose run --rm server npm run smoke:live -- --check
+
+# Pass only the credential required by this backend:
+docker compose run --rm -e OPENAI_API_KEY server npm run smoke:live -- local openai/gpt-5.4-mini
+docker compose run --rm -e LETTA_API_KEY server npm run smoke:live -- cloud openai/gpt-5.4-mini
+```
+
+An ignored `.env` can stay in this worktree. Compose reads it for interpolation
+but does not automatically export its keys into these containers; load the
+selected key into your invoking environment. Do not mount `.env` or put secret
+values in command arguments. Local tests use a fresh temporary HOME. Cloud tests
+use the account's model access and SDK-managed execution, not a connected laptop.
+Neither test uses an existing agent or changes account-level providers.
+
+The test checks real answers, context recall, and a tool call to an independent
+deterministic A2A peer. It prints created/deleted IDs, bounded tool diagnostics,
+and cleanup outcomes, not credentials or reasoning traces. Cancellation is not proved by these successful
+turns. Cloud sandbox termination on close is SDK best-effort, not independent
+evidence that the sandbox stopped.
 
 ## Effect development tools
 
@@ -118,8 +146,8 @@ unauthenticated development endpoint.
 
 Cloud stores agent state in Letta Cloud. `computer` selects execution; omitting it
 uses the SDK's managed-sandbox path. A top-level optional `cwd` refers to that
-runtime's filesystem, not automatically the Docker filesystem. Neither Cloud
-execution choice has been verified in this project yet.
+runtime's filesystem, not automatically the Docker filesystem. The managed-sandbox
+path has live smoke coverage below; connected-computer execution remains unverified.
 
 Keep secrets in an ignored `.env`. Compose does **not** automatically inject that
 file into the container. Pass only the named secret needed for a command, e.g.
@@ -140,6 +168,10 @@ exported in your shell. Do not mount your whole host Letta home to borrow auth.
 - Requests have a two-minute execution deadline. Cancellation requested is not
   proof that backend execution stopped; uncertain contexts are quarantined, not
   automatically retried.
+- Repeated SDK tool-call IDs share their original in-flight or completed result
+  within one session-owned tool group. Reusing an ID with different arguments,
+  tool, or trusted scope is rejected. This also retains uncertain errors without
+  replay; it is not durable deduplication across restarts or new sessions.
 - Default task and context mappings are in memory and do not survive restart.
   Extracted durable/push internals are not yet exposed as server configuration.
 - This is one trusted caller domain. A2A transcript separation does not isolate
@@ -159,8 +191,9 @@ those fields. `npm ci` passes; registry-integrity metadata repair remains pendin
 
 Checkpoint (October 2, 2026): Node 24.19.0, Bun 1.4.2, installed SDK 0.8.28,
 SDK-bundled Code 0.34.2, A2A SDK 1.1.0, and the pinned Effect/TypeScript toolchain
-above. Clean Docker `npm ci` patches the compiler successfully; 36 tests
-(196 assertions), Effect-enabled typecheck, build, and compiled Node imports pass.
+above. Clean Docker `npm ci` patches the compiler successfully; the current suite
+passes 39 tests (211 assertions), Effect-enabled typecheck, and build. Compiled
+Node imports also passed at the foundation checkpoint.
 Compiled Node HTTP discovery and two-turn continuity also pass using fake SDK
 sessions, with disposal awaited at scope exit.
 Temporary negative probes proved that floating Effects, invalid optional fields,
@@ -171,8 +204,28 @@ shutdown exits 1. These tests use fake SDK sessions, not live agent turns.
 An actual SDK local bootstrap and `agents.list()` returned zero agents inside a
 fresh Docker HOME with external networking disabled; Effect scope finalization
 closed the management client, its closed-client guard was verified, and the
-process exited naturally. No agents, host credentials, or model calls were used. Real
-inbound/outbound turns, remote, and both Cloud execution choices remain unverified.
+process exited naturally. That bootstrap test used no agents, host credentials,
+or model calls.
+
+Subsequent live Docker tests used `openai/gpt-5.4-mini` and separate disposable
+agents for local and Cloud-managed-sandbox execution. Both passed discovery, real
+answers, same-context token recall, and a real outbound tool call to an independent
+official-SDK A2A peer. Each peer returned a nonce unavailable in the prompt; the
+agent returned it correctly. Exact agent deletion, scope/client cleanup, and
+temporary HOME removal passed. No existing agents or account providers changed.
+Only the required key was injected into each container; `.env` was not mounted.
+
+Cloud testing exposed duplicate execution callbacks for the **same tool-call ID**
+in SDK 0.8.28. Three failing regression tests reproduced the missing guard. With
+session-scoped deduplication, a subsequent live Cloud run still received two
+callbacks but made exactly one peer request and returned the same result to both.
+Local live regression passed too. This does not establish global exactly-once
+execution or fix the upstream delivery behavior.
+
+Cloud tests requested a five-minute sandbox TTL and best-effort termination on
+session close; independent sandbox termination was not checked. Hosted runtime
+version was not pinned. Remote App Server, Cloud connected-computer execution,
+and live cancellation remain unverified. Successful turns do not prove cancellation.
 
 Before the Effect migration, npm replaced the stalled Bun installer. Both
 the original npm fallback and clean `npm ci` ran lifecycle scripts, including Code

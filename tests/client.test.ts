@@ -30,6 +30,65 @@ const args = { target: "remote", message: "hello" };
 
 
 describe("session-owned SDK A2A tools", () => {
+  test("duplicate SDK call IDs share in-flight and completed results", async () => {
+    const { client } = fixture();
+    let calls = 0;
+    let release!: (value: Task) => void;
+    const response = new Promise<Task>((resolve) => { release = resolve; });
+    client.invoke = async () => { calls++; return response; };
+    const group = createA2ATools({ client, getScope: scope, signal: new AbortController().signal });
+    const tool = group.tools[0]!;
+    const first = tool.execute("same-call", args);
+    const duplicate = tool.execute("same-call", { message: "hello", target: "remote" });
+    try {
+      expect(calls).toBe(1);
+      release(task);
+      expect(await duplicate).toEqual(await first);
+      expect(await tool.execute("same-call", args)).toEqual(await first);
+      expect(calls).toBe(1);
+      await tool.execute("different-call", args);
+      expect(calls).toBe(2);
+    } finally {
+      release(task);
+      await Promise.allSettled([first, duplicate]);
+      await group.close();
+    }
+    expect((await tool.execute("same-call", args)).isError).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  test("reused SDK call IDs cannot change arguments, tool, or trusted scope", async () => {
+    const { client, scopes } = fixture();
+    let conversationId = "conversation-1";
+    const group = createA2ATools({
+      client, getScope: () => ({ agentId: "agent-1", conversationId }), signal: new AbortController().signal,
+    });
+    try {
+      expect((await group.tools[0]!.execute("bound-call", args)).isError).toBe(false);
+      expect((await group.tools[0]!.execute("bound-call", { ...args, message: "different" })).isError).toBe(true);
+      expect((await group.tools[1]!.execute("bound-call", { target: "remote", task_id: "task-1", action: "cancel" })).isError).toBe(true);
+      conversationId = "conversation-2";
+      expect((await group.tools[0]!.execute("bound-call", args)).isError).toBe(true);
+      expect(scopes).toEqual(["agent-1/conversation-1"]);
+    } finally { await group.close(); }
+  });
+
+  test("duplicate SDK call IDs never replay an ambiguous failed submission", async () => {
+    const { client } = fixture();
+    let calls = 0;
+    client.invoke = async () => {
+      calls++;
+      throw new A2AInvocationError("Outcome unknown", { submissionAttempted: true });
+    };
+    const group = createA2ATools({ client, getScope: scope, signal: new AbortController().signal });
+    try {
+      const first = await group.tools[0]!.execute("uncertain", args);
+      expect(first.isError).toBe(true);
+      expect(await group.tools[0]!.execute("uncertain", args)).toEqual(first);
+      expect(calls).toBe(1);
+    } finally { await group.close(); }
+  });
+
   test("strict arguments and trusted ready scope", async () => {
     const { client, scopes } = fixture();
     for (const bad of [
@@ -86,13 +145,13 @@ describe("session-owned SDK A2A tools", () => {
     });
     await first.tools[0]!.execute("1", args);
     await first.close();
-    await second.tools[0]!.execute("2", args);
+    await second.tools[0]!.execute("1", args);
     const reconnect = createA2ATools({
       client,
       getScope: scope,
       signal: new AbortController().signal,
     });
-    await reconnect.tools[0]!.execute("3", args);
+    await reconnect.tools[0]!.execute("1", args);
     expect(scopes).toEqual([
       "agent-1/conversation-1",
       "agent-1/conversation-2",

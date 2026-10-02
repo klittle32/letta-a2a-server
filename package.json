@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "test": "bun test tests",
+    "smoke:live": "node --import tsx scripts/smoke-live.ts",
     "start": "node dist/main.js",
     "prepare": "effect-tsgo patch --typescript --no-oxlint"
   },

@@ -21,6 +21,11 @@ services:
         read_only: true
         bind: { create_host_path: false }
       - type: bind
+        source: ./scripts
+        target: /app/scripts
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
         source: ./package.json
         target: /app/package.json
         read_only: true

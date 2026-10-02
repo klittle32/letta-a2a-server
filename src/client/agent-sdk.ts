@@ -1,6 +1,8 @@
 import type { AnyAgentTool } from "@letta-ai/letta-agent-sdk";
 import {
   getA2AToolDefinitions,
+  readA2AArguments,
+  resolveA2AScope,
   runA2ATool,
   type A2AScopeGetter,
   type A2AToolClient,
@@ -37,6 +39,9 @@ export function createA2ATools(options: CreateA2AToolsOptions): A2AToolGroup {
   if (options.signal.aborted) abort();
   else options.signal.addEventListener("abort", abort, { once: true });
   const active = new Set<Promise<A2AToolResult>>();
+  // Cloud delivery can repeat the same SDK tool call. Keep its original outcome
+  // (including uncertainty) for this session, never submit it again.
+  const calls = new Map<string, { binding: string; pending: Promise<A2AToolResult> }>();
   // Caller-facing timeout/cancellation results can precede persistence and lock
   // release. Keep the exact original signals for service-owned work tracking.
   const usedSignals = new Set<AbortSignal>();
@@ -66,6 +71,7 @@ export function createA2ATools(options: CreateA2AToolsOptions): A2AToolGroup {
           () => {
             clearTimeout(timer);
             usedSignals.clear();
+            calls.clear();
             resolve();
           },
           () => {
@@ -85,17 +91,44 @@ export function createA2ATools(options: CreateA2AToolsOptions): A2AToolGroup {
     (definition) => ({
       ...definition,
       label: definition.name,
-      async execute(_toolCallId: string, args: unknown, signal?: AbortSignal) {
+      async execute(toolCallId: string, args: unknown, signal?: AbortSignal) {
+        const refuse = (error: string) => ({
+          content: [{ type: "text" as const, text: JSON.stringify({ status: "error", error }) }],
+          isError: true,
+        });
+        if (owner.signal.aborted || signal?.aborted)
+          return refuse("A2A tool owner or caller is closed or canceled; no new submission attempted");
+        let binding: string;
+        try {
+          if (typeof toolCallId !== "string" || !toolCallId.trim()) throw new Error("Missing call ID");
+          binding = JSON.stringify([
+            definition.name,
+            resolveA2AScope(options.getScope),
+            readA2AArguments(definition.name, args),
+          ]);
+        } catch {
+          return refuse("Invalid SDK tool-call ID, arguments, or ready scope");
+        }
+        const previous = calls.get(toolCallId);
+        if (previous && previous.binding !== binding)
+          return refuse("SDK tool-call ID was reused with different arguments, tool, or scope");
         const combined = signal
           ? AbortSignal.any([owner.signal, signal])
           : owner.signal;
-        if (!owner.signal.aborted) usedSignals.add(combined);
-        const pending = runA2ATool(definition.name, args, {
-          client: options.client,
-          getScope: options.getScope,
-          signal: combined,
-        });
-        active.add(pending);
+        let pending = previous?.pending;
+        if (!pending) {
+          const deferred = Promise.withResolvers<A2AToolResult>();
+          pending = deferred.promise;
+          // Bind before dispatch, including synchronous/reentrant callbacks.
+          calls.set(toolCallId, { binding, pending });
+          usedSignals.add(combined);
+          active.add(pending);
+          void runA2ATool(definition.name, args, {
+            client: options.client,
+            getScope: options.getScope,
+            signal: combined,
+          }).then(deferred.resolve, deferred.reject);
+        }
         try {
           const result = await pending;
           return {
