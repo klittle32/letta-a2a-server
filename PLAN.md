@@ -1,6 +1,6 @@
 # Letta A2A Server — extraction plan
 
-Status: approved for implementation on October 2, 2026. Kyle also authorized initializing Git, committing this plan, and creating the public `klittle32/letta-a2a-server` GitHub repository. Package publication and deployment remain separate decisions.
+Status: Phases 1–4 are delivered in source at base commit `7890e9c8c7bd732c9c4235634000a84a5da3f055`. The currently approved focused cleanup also includes Effect/source/test fixes. Phase 5 packaging remains pending. Persistent-service activation, package publication, and deployment remain separate decisions.
 
 Source: [letta-a2a issue #2](https://github.com/klittle32/letta-a2a/issues/2), reviewed against lab commit `2972081` on October 2, 2026.
 
@@ -68,7 +68,7 @@ Concrete adaptation points:
 - The lab's remote-only client setup, `/workspace`, test model, empty-tool agents, OAuth fixture, and mandatory callback settings are not general server defaults.
 - Historical live evidence is not verification of today's SDK or all three runtime modes.
 
-## Phase 1 — verify the SDK seam and freeze the small scope
+## Phase 1 — verify the SDK seam and freeze the small scope (delivered)
 
 **Goal:** establish the compatibility baseline before moving substantial code.
 
@@ -83,7 +83,7 @@ Concrete adaptation points:
 
 Current registry observations, not verified compatibility: SDK `0.8.28`, Code `0.34.2`, A2A JS SDK `1.3.0`. The lab uses SDK `0.8.3` and A2A JS SDK `1.1.0`. SDK `0.8.28` itself pins Code `0.34.2`; distinguish that upstream packaging choice from this project's minimum-version policy. Do not force a broad A2A library/protocol upgrade into extraction unless necessary.
 
-## Phase 2 — extract one working, bidirectional server
+## Phase 2 — extract one working, bidirectional server (delivered)
 
 **Goal:** a fresh local checkout can serve one existing agent and call one external peer, directly.
 
@@ -97,69 +97,55 @@ Current registry observations, not verified compatibility: SDK `0.8.28`, Code `0
 
 **Done when:** an independent A2A client discovers the agent, sends a message, continues its context, and asks it to call a configured peer and return the result. No agentgateway, LiteLLM, Docker lab, global mod, or auto-created agent is required.
 
-## Phase 3 — configure several fixed agent bindings
+## Phase 3 — configure several fixed agent bindings (delivered)
 
-**Goal:** one process/port serves multiple independent configured agents.
+**Delivered:** one process/port serves multiple fixed configured agents. The configuration and operational details are in [Configuration reference](docs/configuration.md).
 
-**Implementation checkpoint (October 3, 2026 UTC):** implemented in the Phase 3
-worktree. Legacy and multi-binding CLI paths, optional inbound
-bearer authentication, mounted card discovery, startup validation, and separate
-binding resources are covered by 61 tests / 290 assertions, compiler/build gates,
-and independent review. A live local-backend test passed with two disposable
-agents, reused A2A message/context IDs, separate recall, cross-task denial, and
-verified exact-ID cleanup. See the README for the runnable example and evidence
-limits. After separate approval, the local development service on `41242` was
-activated with `/agents/first/` and `/agents/second/`; both passed host Go CLI
-streaming checks. The first local identity was retained and one additional
-persistent local test agent was created. The Cloud-backed service on `41241`
-was not restarted or changed. At activation, source was still uncommitted in the
-worktree.
+Legacy and multi-binding configuration, optional inbound bearer authentication,
+mounted card discovery, startup validation, and binding-owned resources are
+implemented. The earlier local two-agent trial and its limits are summarized in
+[Development and support](docs/development.md). The deleted Phase 3 worktree and
+its activation procedure are historical; they are not setup instructions.
 
-The trial image was built from this worktree before Git delivery, not the then-older
-primary checkout. Rebuild only from a checkout containing Phase 3. The shared
-`letta-a2a-server:dev` image tag now points to Phase 3; an all-service Compose
-update can therefore also recreate the still-older Cloud-backed container.
-Use service-specific operations when that service must remain untouched.
+Compose is image-based: `docker compose run` and `docker compose up -d` do not
+automatically rebuild an existing image after checkout changes. Run
+`docker compose build server` before using newly changed source. Activating rebuilt code in persistent
+services is separate approval. `docker compose up -d --build` rebuilds and may
+recreate both services. The host CLI's local endpoint uses host port `41242`,
+mapped to container port `41241`.
 
-- Extend the same configuration with named backend connections and agent bindings. Reuse connection settings without introducing client pooling unless the SDK requires it; independent binding clients are the simple starting point.
-- Each binding owns its route, existing agent ID, card identity, peer access, and task/conversation namespace. Keep outbound context stores binding-specific too: coincident agent/conversation IDs on different backends must not share peer context. No caller-supplied agent IDs or dynamic provisioning.
-- Support mounted endpoints such as `/scooter` and `/researcher`, including a configured external path prefix. Compute discovery and callable URLs from explicit public configuration, not unchecked request headers or assumed gateway rewriting.
-- Keep caller-to-server auth, server-to-Letta auth, and server-to-peer auth separate. For the initial trusted deployment, use a small optional bearer-auth configuration with a stable owner identity; anonymous access stays loopback-only. A shared token is one trust domain, not tenant isolation. No new OAuth server or identity platform.
-- Reject duplicate routes/invalid bindings at startup. Keep credentials and ownership separate even when bindings share a backend address.
+**Delivered boundaries:** each binding owns its route, task/conversation namespace, SDK client, peer context, and tools. Configuration validates route collisions and computes advertised paths from explicit public URLs. Caller-to-server, server-to-Letta, and server-to-peer credentials remain separate. A shared token is one trust domain; bindings that reference the same agent share its memory.
 
-**Done when:** two cards and two endpoints work on one listener; reused task/context IDs cannot cross bindings; unauthorized operations fail; authenticated discovery and invocation work independently; advertised URLs remain callable under mounted paths.
+## Phase 4 — verify the complete runtime and protocol boundary (implementation delivered; activation pending)
 
-Conversation separation does not isolate the shared memory of one Letta agent. Document this rather than presenting fixed bindings as a multi-tenant security product.
+**Goal:** the same server configuration model works across the promised runtime choices. The implementation and Phase 4 checks are delivered; persistent-service activation remains separate approval. See [Development and support](docs/development.md) for the matrix evidence and its explicit unverified cases.
 
-## Phase 4 — verify the complete runtime and protocol boundary
-
-**Goal:** the same server configuration model works across the promised runtime choices.
-
-| Mode | Runtime relationship to verify |
+| Mode | Runtime relationship |
 | --- | --- |
 | Local | SDK-managed local App Server; local state/execution; document the Code version supplied by the SDK. |
 | Remote | Already-running App Server; its own authentication, state backend, execution machine, and lifecycle. |
 | Cloud | Cloud agent/state with either a supported selected computer or managed sandbox; `cwd` belongs to that execution environment. |
 
-- Run the same direct-boundary checks in each supported mode: discovery, message/result, context continuation, outbound invocation, failure, streaming, and supported cancellation. Exercise both Cloud execution choices before claiming both work.
-- Test two-binding isolation, concurrent context handling, shutdown, and credential separation. Include private App Server access and an authenticated peer.
-- Preserve the distinction between cancellation requested and backend execution confirmed stopped. Disconnect is not cancellation, uncertainty is not safe retry, and sent work is never blindly replayed.
-- Carry existing durable-state behavior/tests where extracted, with a small opt-in only; do not redesign recovery. State clearly what survives restart under the default profile.
-- Use deterministic provider-free tests for protocol/configuration coverage and small live smoke tests for runtime claims. No mandatory gateway integration matrix.
+The Phase 4 implementation and its bounded runtime matrix were delivered at the
+base commit. The listed unverified combinations remain explicit limits; they are
+not a new Phase 4 completion gate. Activating persistent services is separate
+approval and does not imply that the Cloud service was activated. Evidence and
+unverified cases are in
+[Development and support](docs/development.md). Preserve the distinction between
+cancellation requested and backend execution confirmed stopped; interruption,
+disconnect, and successful turns do not prove remote stop.
 
-**Done when:** the support matrix names exact tested versions, execution environments, passing checks, and limitations. An unsupported or untested combination is labeled honestly rather than treated as parity.
-
-## Phase 5 — package and document the standalone product
+## Phase 5 — package and document the standalone product (pending)
 
 **Goal:** a new user can install it and make a successful direct call without studying the lab.
 
 - Verify an installed/packed artifact in a clean temporary directory, not only imports from the development checkout. One common install/start path; verify it without the source repository's dependencies present.
-- Write a short README: purpose, one-agent quick start, three runtime configurations, two-agent example, outbound peers, auth boundaries, public URLs, and operational limits.
+- Keep a short product README and focused configuration/development references; avoid retaining internal worktree history or a new evidence archive.
 - Retain focused tests and modest CI, not the entire lab suite. Keep raw lab history, old evidence bundles, gateway configurations, Python/Hermes demos, OAuth fixtures, and deployment experiments in `letta-a2a`.
 - Review for unnecessary abstraction and configuration. Keep optional advanced capabilities out of the first quick start.
 - The public repository is authorized at project initialization. Add a link from the lab when the extraction is ready and that lab change is approved. npm publication or deployment remains a separate action, not implied by implementation.
 
-**Done when:** the packaged one-agent and two-agent examples work from their instructions, licensing is intact, and all advertised behavior has evidence.
+**Done when:** the packed artifact and one-agent/two-agent examples work from their instructions, licensing is intact, and all advertised behavior has evidence. Package publication and install parity have not been verified.
 
 ## Explicit non-goals
 

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { DurableBinding, executionContextKey } from "../src/bridge/durable-binding.js";
 import { SqliteBindingStore } from "../src/bridge/sqlite-store.js";
 import { parseApplicationConfig } from "../src/config.js";
-import { Effect, Exit, Scope } from "effect";
+import { Cause, Effect, Exit, Scope } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { createA2AClient } from "../src/client/index.js";
 import { startApplicationServer } from "../src/server.js";
@@ -50,6 +50,29 @@ test("upgrading an existing durable profile preserves its original agent identit
     await binding?.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("durable identity mismatch is a typed startup failure and closes acquired resources", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-startup-mismatch-"));
+  const existing = await DurableBinding.open({ directory: root, bindingId: "default" });
+  existing.bindAgent("original-agent", JSON.stringify(["local", "local", null]));
+  await existing.close();
+  let clientClosed = false;
+  const client = { agents: { async retrieve(id: string) { return { id }; } }, async close() { clientClosed = true; } } as unknown as LettaAgentClient;
+  const config = parseApplicationConfig({ agentId: "different-agent", backend: { type: "local" }, stateDirectory: root,
+    port: 0, publicUrl: "http://127.0.0.1:0" });
+  try {
+    const exit = await Effect.runPromiseExit(Effect.scoped(startApplicationServer(config, () => client)));
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (Exit.isFailure(exit)) {
+      expect(Cause.hasFails(exit.cause)).toBe(true);
+      expect(Cause.hasDies(exit.cause)).toBe(false);
+      expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "StateIdentityError" });
+    }
+    expect(clientClosed).toBe(true);
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "default" });
+    await reopened.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("application restart restores completed tasks and resumes the SDK conversation", async () => {

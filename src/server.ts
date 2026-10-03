@@ -5,10 +5,9 @@ import type { AddressInfo } from "node:net";
 import { Context, Effect, Layer, Schema } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AgentSdkTurnRunner, DurableBinding, createBridge, createBridgeRouter } from "./bridge/index.js";
-import type { BridgeOptions } from "./bridge/bridge.js";
 import { createA2AClient, FileContextStore } from "./client/index.js";
 import { createA2ATools } from "./client/agent-sdk.js";
-import { validatePeerAliases, validatePeerConfiguration, type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
+import { validatePeerAliases, type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
 
 export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()("ServerStartupError", {
   message: Schema.String,
@@ -28,12 +27,21 @@ export function withTurnDeadline(runner: AgentSdkTurnRunner, timeoutMs = 120_000
   };
 }
 
-function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.ProcessEnv) {
+class PeerConfigurationError extends Schema.TaggedError<PeerConfigurationError>()("PeerConfigurationError", {
+  message: Schema.String,
+}) {}
+
+class StateIdentityError extends Schema.TaggedError<StateIdentityError>()("StateIdentityError", {
+  message: Schema.String,
+}) {}
+
+type BearerBridgeOptions = Pick<import("./bridge/bridge.js").BridgeOptions, "auth" | "security" | "transport">;
+
+function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.ProcessEnv): Partial<BearerBridgeOptions> {
   if (!binding.auth) return {};
   const token = env[binding.auth.tokenEnv];
-  if (!token?.trim()) throw new ServerStartupError({ message: `Required environment variable ${binding.auth.tokenEnv} is missing` });
+  if (!token?.trim()) throw new PeerConfigurationError({ message: `Required environment variable ${binding.auth.tokenEnv} is missing` });
   const owner = binding.auth.owner;
-  const unauthorized: import("express").RequestHandler = (_req, _res, next) => next();
   const gate: import("express").RequestHandler = (req, res, next) => {
     const values = req.headers.authorization;
     if (Array.isArray(values) || (values && !/^Bearer [^\s,]+$/i.test(values))) { res.status(401).json({ error: "Authentication required" }); return; }
@@ -49,9 +57,9 @@ function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.
       },
       authorize: async ({ caller }: { caller: { subject: string } }) => caller.subject === owner,
     },
-    security: { securitySchemes: { bearer: { scheme: { $case: "httpAuthSecurityScheme", value: { scheme: "Bearer", description: "Bearer token authentication", bearerFormat: "opaque" } } } }, securityRequirements: [{ schemes: { bearer: [] } }] },
+    security: { securitySchemes: { bearer: { scheme: { $case: "httpAuthSecurityScheme", value: { scheme: "Bearer", description: "Bearer token authentication", bearerFormat: "opaque" } } } }, securityRequirements: [{ schemes: { bearer: { list: [] } } }] },
     transport: {
-      middleware: [unauthorized, gate],
+      middleware: [gate],
       userBuilder: async () => ({ isAuthenticated: true, userName: owner }),
     },
   };
@@ -59,11 +67,11 @@ function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.
 
 function constantTimeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left); const b = Buffer.from(right);
-  return a.length === b.length && requireTimingSafeEqual(a, b);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
-function requireTimingSafeEqual(a: Buffer, b: Buffer): boolean {
-  return timingSafeEqual(a, b);
-}
+
+const typedPeerValidation = (peers: Parameters<typeof validatePeerAliases>[0], env: NodeJS.ProcessEnv) =>
+  Effect.try({ try: () => validatePeerAliases(peers, env), catch: () => new PeerConfigurationError({ message: "Peer configuration is invalid or incomplete" }) });
 
 // Imported promises do not establish backend cancellation. Finalizers await the
 // actual public disposal promises, uninterruptibly, and never retry sent work.
@@ -77,6 +85,25 @@ const shutdown = (message: string, dispose: () => PromiseLike<unknown> | void) =
     Effect.tapError((error) => Effect.logError(error.message)),
     Effect.orDie,
   );
+
+function acquireHttpListener(app: express.Express, port: number, host: string) {
+  return Effect.acquireRelease(
+    Effect.try({ try: () => app.listen(port, host), catch: () => new ServerStartupError({ message: "HTTP listener acquisition failed" }) }),
+    (listener) => shutdown("HTTP listener shutdown failed", () => new Promise<void>((resolve, reject) => {
+      listener.close((error) => {
+        if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+        else resolve();
+      });
+      // Closing connections does not cancel SDK work; bridge cleanup owns that.
+      listener.closeAllConnections();
+    })),
+  );
+}
+
+function awaitListener(listener: ReturnType<express.Express["listen"]>) {
+  return Effect.tryPromise({ try: () => once(listener, "listening"), catch: () => new ServerStartupError({ message: "HTTP listener startup failed" }) })
+    .pipe(Effect.uninterruptible);
+}
 
 /** Only clients explicitly constructed by this acquisition are scope-owned. */
 export const acquireSdkClient = Effect.fn("Server.acquireSdkClient")(
@@ -102,7 +129,7 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
     if (agent.id !== config.agentId) {
       return yield* new ServerStartupError({ message: "Configured agent identity could not be verified" });
     }
-    validatePeerAliases(config.peers, env);
+    yield* typedPeerValidation(config.peers, env);
     const peers = Object.fromEntries(Object.entries(config.peers).map(([name, peer]) => [name, typeof peer === "string" ? { url: peer } : peer]));
     const durability = config.stateDirectory
       ? yield* Effect.acquireRelease(
@@ -121,6 +148,8 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
           const policyCache = new Map<string, NonNullable<Parameters<typeof createA2AClient>[0]["routePolicies"]>[string]>();
           const routePolicies = Object.fromEntries(Object.entries(peers).flatMap(([alias, peer]) => {
             if (!peer.auth) return [];
+            const auth = peer.auth;
+            const token = env[auth.tokenEnv]!;
             const endpoint = new URL(peer.url).href;
             const signature = JSON.stringify([endpoint, peer.auth.owner, peer.auth.tokenEnv]);
             const existing = policyCache.get(signature);
@@ -129,9 +158,9 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
             const policy = {
               destinationOrigins: [origin], peerIdentity: `peer:${endpoint}`,
               credential: {
-                owner: peer.auth.owner, audience: endpoint, origins: [origin], headerNames: ["authorization"],
-                provide: async () => ({ owner: peer.auth!.owner, audience: endpoint,
-                  headers: { authorization: `Bearer ${env[peer.auth!.tokenEnv]!}` } }),
+                owner: auth.owner, audience: endpoint, origins: [origin], headerNames: ["authorization"],
+                provide: async () => ({ owner: auth.owner, audience: endpoint,
+                  headers: { authorization: `Bearer ${token}` } }),
               },
             };
             policyCache.set(signature, policy);
@@ -151,7 +180,8 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
       config.backend.type === "remote" ? config.backend.tokenEnv ?? null :
         config.backend.type === "cloud" ? config.backend.apiKeyEnv ?? null : null,
     ]);
-    durability?.bindAgent(config.agentId, backendIdentity);
+    yield* Effect.try({ try: () => durability?.bindAgent(config.agentId, backendIdentity),
+      catch: () => new StateIdentityError({ message: "Durable state identity does not match this binding" }) });
     const runner = new AgentSdkTurnRunner(client, config.agentId, {
       sharingDomain: config.id ?? config.agentId,
       ...(durability ? { conversationMapping: durability.conversationMapping, execution: durability.execution } : {}),
@@ -176,7 +206,7 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
           ...(durability ? { backendIdentity, durabilityAgentId: config.agentId } : {}),
           publicBaseUrl: config.publicUrl,
           name: config.name,
-          ...(extra as unknown as Pick<BridgeOptions, "auth" | "security" | "transport">),
+          ...extra,
         }),
         catch: () => new ServerStartupError({ message: "Inbound bridge construction failed" }),
       }),
@@ -198,26 +228,9 @@ export const startServer = Effect.fn("Server.start")(
     app.disable("x-powered-by");
     app.get("/healthz", (_request, response) => response.json({ status: "ok" }));
     app.use(createBridgeRouter(bridge));
-    const listener = yield* Effect.acquireRelease(
-      Effect.try({
-        try: () => app.listen(config.port, host),
-        catch: () => new ServerStartupError({ message: "HTTP listener acquisition failed" }),
-      }),
-      (resource) => shutdown("HTTP listener shutdown failed", () => new Promise<void>((resolve, reject) => {
-        resource.close((error) => {
-          if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(error);
-          else resolve();
-        });
-        // Closing connections does not cancel SDK work. The bridge finalizer
-        // separately requests cancellation and awaits session/tool disposal.
-        resource.closeAllConnections();
-      })),
-    );
+    const listener = yield* acquireHttpListener(app, config.port, host);
     // Observe the actual listening/error event before advancing acquisition.
-    yield* Effect.tryPromise({
-      try: () => once(listener, "listening"),
-      catch: () => new ServerStartupError({ message: "HTTP listener startup failed" }),
-    }).pipe(Effect.uninterruptible);
+    yield* awaitListener(listener);
     const address = listener.address() as AddressInfo;
     const url = new URL(config.publicUrl);
     if (url.port === "0") {
@@ -241,14 +254,15 @@ export const startApplicationServer = Effect.fn("Server.startApplicationServer")
   function* (config: ApplicationConfig, createClient: (binding: ApplicationBindingConfig) => LettaAgentClient, host = "127.0.0.1", env: NodeJS.ProcessEnv = process.env) {
     const app = express(); app.disable("x-powered-by");
     app.get("/healthz", (_request, response) => response.json({ status: "ok" }));
-    for (const binding of config.bindings) validatePeerConfiguration(binding.peers, env);
+    for (const binding of config.bindings) yield* typedPeerValidation(binding.peers, env);
     const bridges: Array<{ binding: ApplicationBindingConfig; bridge: ReturnType<typeof createBridge> }> = [];
     for (const binding of config.bindings) {
       const client = yield* acquireSdkClient(() => createClient(binding));
       const serverConfig: ServerConfig & { id: string } = { id: binding.id, agentId: binding.agentId, name: binding.name, backend: binding.backend, port: config.port,
         publicUrl: binding.publicUrl, peers: binding.peers,
         ...(binding.stateDirectory ? { stateDirectory: binding.stateDirectory } : {}), ...(binding.cwd ? { cwd: binding.cwd } : {}) };
-      const extra = makeBearerBridgeOptions(binding, env);
+      const extra = yield* Effect.try({ try: () => makeBearerBridgeOptions(binding, env),
+        catch: () => new PeerConfigurationError({ message: "Inbound authentication configuration is invalid or incomplete" }) });
       const bridge = (yield* acquireBinding(serverConfig, client, extra, env)).bridge;
       bridges.push({ binding, bridge });
       const externalPrefix = new URL(config.publicUrl).pathname.replace(/\/$/, "");
@@ -265,12 +279,8 @@ export const startApplicationServer = Effect.fn("Server.startApplicationServer")
         routed(req, res, (routeError) => { req.url = originalUrl; next(routeError); });
       });
     }
-    const listener = yield* Effect.acquireRelease(Effect.try({
-      try: () => app.listen(config.port, host), catch: () => new ServerStartupError({ message: "HTTP listener acquisition failed" }),
-    }), (resource) => shutdown("HTTP listener shutdown failed", () => new Promise<void>((resolve, reject) => {
-      resource.close((error) => error ? reject(error) : resolve()); resource.closeAllConnections();
-    })));
-    yield* Effect.tryPromise({ try: () => once(listener, "listening"), catch: () => new ServerStartupError({ message: "HTTP listener startup failed" }) }).pipe(Effect.uninterruptible);
+    const listener = yield* acquireHttpListener(app, config.port, host);
+    yield* awaitListener(listener);
     const address = listener.address() as AddressInfo;
     const prefix = new URL(config.publicUrl);
     if (prefix.port === "0") prefix.port = String(address.port);

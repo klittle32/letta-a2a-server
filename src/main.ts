@@ -7,8 +7,7 @@ import type { ApplicationBindingConfig } from "./config.js";
 
 export const applicationProgram = (
   configPath = process.argv[2] ?? "config.local.json",
-  createClient: (binding: ApplicationBindingConfig) => LettaAgentClient = (binding) =>
-    new LettaAgentClient(sdkOptions(binding.backend)),
+  createClient: ((binding: ApplicationBindingConfig) => LettaAgentClient) | undefined = undefined,
   host = process.env.A2A_LISTEN_HOST ?? "127.0.0.1",
   env: NodeJS.ProcessEnv = process.env,
 ) => Effect.scoped(Effect.gen(function* () {
@@ -23,7 +22,8 @@ export const applicationProgram = (
         catch: () => new ConfigurationError({ message: "Unable to resolve SDK backend configuration" }),
       });
     }
-    const server = yield* startApplicationServer(config, createClient, host, env);
+    const construct = createClient ?? ((binding: ApplicationBindingConfig) => new LettaAgentClient(sdkOptions(binding.backend, env)));
+    const server = yield* startApplicationServer(config, construct, host, env);
     yield* Effect.logInfo(`Letta A2A Server: ${server.url}`);
     for (const [id, url] of Object.entries(server.bindings))
       yield* Effect.logInfo(`Binding ${id}: ${url}`);

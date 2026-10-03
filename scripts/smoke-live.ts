@@ -15,7 +15,7 @@ import { Effect, Exit, Scope } from "effect";
 import { A2A_PROTOCOL_VERSION, AGENT_CARD_PATH, AgentCard, Role, TaskState, type SendMessageResult } from "@a2a-js/sdk";
 import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory } from "@a2a-js/sdk/client";
 import { AgentEvent, DefaultRequestHandler, InMemoryTaskStore } from "@a2a-js/sdk/server";
-import { agentCardHandler, jsonRpcHandler } from "@a2a-js/sdk/server/express";
+import { jsonRpcHandler } from "@a2a-js/sdk/server/express";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { startServer } from "../src/server.js";
 import { parseConfig, sdkOptions, type ServerConfig } from "../src/config.js";
@@ -73,7 +73,9 @@ function observeResults(client: LettaAgentClient, peerNonce: string) {
     };
   }
 }
-function assert(value: unknown): asserts value { if (!value) throw new Error("fixture assertion failed"); }
+function assert(value: unknown, message = "fixture assertion failed"): asserts value {
+  if (!value) throw new Error(message);
+}
 const limitMs = 120_000;
 type Mode = "local" | "remote" | "cloud" | "computer";
 function modeFromArgs(value: string | undefined): Mode | undefined {
@@ -189,7 +191,15 @@ async function peer() {
     name: "Disposable deterministic smoke peer", description: "Returns a private receipt nonce",
     version: "1", supportedInterfaces: [{ url: "http://127.0.0.1:0/", protocolBinding: "JSONRPC", protocolVersion: A2A_PROTOCOL_VERSION }],
     capabilities: { streaming: false }, defaultInputModes: ["text/plain"], defaultOutputModes: ["text/plain"],
-    securitySchemes: { bearer: { scheme: { $case: "httpAuthSecurityScheme", value: { scheme: "Bearer", description: "Bearer token authentication", bearerFormat: "opaque" } } } },
+    securitySchemes: {
+      bearer: {
+        httpAuthSecurityScheme: {
+          scheme: "Bearer",
+          description: "Bearer token authentication",
+          bearerFormat: "opaque",
+        },
+      },
+    },
     securityRequirements: [{ schemes: { bearer: [] } }],
   });
   const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), {
@@ -210,7 +220,12 @@ async function peer() {
     if (request.headers.authorization !== `Bearer ${token}`) return response.sendStatus(401);
     next();
   });
-  app.use(`/${AGENT_CARD_PATH}`, agentCardHandler({ agentCardProvider: async () => card }));
+  app.use(`/${AGENT_CARD_PATH}`, (_request, response) => {
+    // Match the production protected-card path: SDK 1.1's convenience handler
+    // sends its internal object shape rather than canonical ProtoJSON.
+    response.setHeader("Cache-Control", "private, no-store");
+    response.json(AgentCard.toJSON(card));
+  });
   app.use(jsonRpcHandler({ requestHandler: handler, userBuilder: async () => ({
     get isAuthenticated() { return true; }, get userName() { return "smoke-fixture"; },
   }) }));
@@ -338,6 +353,16 @@ async function main() {
     process.env.SMOKE_PEER_TOKEN = endpoint.token;
     peerTokenWasSet = true;
     if (check) {
+      for (const [path, method] of [[`/${AGENT_CARD_PATH}`, "GET"], ["/", "POST"]] as const) {
+        const denied = await fetch(`${endpoint.url}${path}`, {
+          method,
+          headers: { authorization: `Bearer ${randomUUID()}`, "content-type": "application/json" },
+          ...(method === "POST" ? { body: "{}" } : {}),
+          signal: AbortSignal.timeout(limitMs),
+        });
+        assert(denied.status === 401, `Peer ${method} endpoint must reject an incorrect Bearer token`);
+        await denied.arrayBuffer();
+      }
       let refused = false;
       try {
         const wrong = await deadline(peerClient(randomUUID()).createFromUrl(endpoint.url));
@@ -348,8 +373,17 @@ async function main() {
         headers: { authorization: `Bearer ${endpoint.token}` }, signal: AbortSignal.timeout(limitMs),
       });
       assert(advertisedCardResponse.ok);
-      const advertisedCard = await advertisedCardResponse.json() as { securitySchemes?: Record<string, unknown>; securityRequirements?: unknown[] };
-      assert(!!advertisedCard.securitySchemes?.bearer && !!advertisedCard.securityRequirements?.length);
+      assert(advertisedCardResponse.headers.get("cache-control") === "private, no-store");
+      const advertisedCard = AgentCard.fromJSON(await advertisedCardResponse.json());
+      const bearer = advertisedCard.securitySchemes.bearer?.scheme;
+      assert(
+        bearer?.$case === "httpAuthSecurityScheme" && bearer.value.scheme.toLowerCase() === "bearer",
+        "Peer Agent Card must advertise a populated HTTP Bearer security scheme",
+      );
+      assert(
+        advertisedCard.securityRequirements.some((requirement) => Object.hasOwn(requirement.schemes, "bearer")),
+        "Peer Agent Card must require its advertised Bearer scheme",
+      );
       const remote = await deadline(peerClient(endpoint.token).createFromUrl(endpoint.url));
       const answer = await turn(remote, "fixture receipt");
       assert(answer.text === endpoint.nonce && Number(endpoint.receipts.length) === 1);

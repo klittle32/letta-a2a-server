@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Effect, Scope } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
@@ -64,4 +65,43 @@ test("normal CLI program retains the legacy single-agent config path", async () 
     await running.catch(() => undefined);
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("default applicationProgram client uses the injected environment", async () => {
+  // Keep module mocking isolated from the other tests, and resolve this checkout
+  // rather than whichever directory invoked `bun test`.
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  const script = `
+    import { mock } from "bun:test";
+    import { Effect, Exit, FileSystem } from "effect";
+    let captured;
+    mock.module("@letta-ai/letta-agent-sdk", () => ({
+      LettaAgentClient: class {
+        constructor(options) {
+          captured = options;
+          throw new Error("Stop before any connection is opened");
+        }
+      }
+    }));
+    const { applicationProgram } = await import("./src/main.ts");
+    const program = applicationProgram("unused.json", undefined, "127.0.0.1", { REVIEW_BACKEND_KEY: "injected-sentinel" })
+      .pipe(Effect.provideService(FileSystem.FileSystem, FileSystem.makeNoop({
+        readFileString: () => Effect.succeed(JSON.stringify({ agentId: "remote-agent", backend: { type: "remote", url: "http://127.0.0.1:1", tokenEnv: "REVIEW_BACKEND_KEY" }, port: 0, publicUrl: "http://127.0.0.1:0" }))
+      })));
+    const exit = await Effect.runPromiseExit(program);
+    console.log(JSON.stringify({ captured, failed: Exit.isFailure(exit) }));
+  `;
+  const child = Bun.spawn([process.execPath, "--eval", script], {
+    cwd: root, stdout: "pipe", stderr: "pipe",
+    env: { ...process.env, REVIEW_BACKEND_KEY: "process-sentinel" },
+  });
+  const [output, errors, status] = await Promise.all([
+    new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+  ]);
+  expect(status).toBe(0);
+  expect(errors).toBe("");
+  expect(JSON.parse(output)).toEqual({
+    captured: { backend: "remote", url: "http://127.0.0.1:1", authToken: "injected-sentinel" },
+    failed: true,
+  });
 });

@@ -103,6 +103,15 @@ export type ApplicationBindingConfig = {
 };
 export interface ApplicationConfig { port: number; publicUrl: string; bindings: ApplicationBindingConfig[] }
 
+function normalizeBinding(id: string, path: string, publicUrl: string, agentId: string, name: string,
+  backend: ServerConfig["backend"], port: number, peers: ServerConfig["peers"],
+  options: { cwd?: string; stateDirectory?: string; auth?: { tokenEnv: string; owner: string } } = {}): ApplicationBindingConfig {
+  return { id, path, publicUrl: publicUrl.endsWith("/") ? publicUrl : `${publicUrl}/`, agentId, name, backend, port,
+    peers: normalizePeers(peers), ...(options.cwd ? { cwd: options.cwd } : {}),
+    ...(options.stateDirectory ? { stateDirectory: options.stateDirectory } : {}),
+    ...(options.auth ? { auth: options.auth } : {}) };
+}
+
 export class ConfigurationError extends Schema.TaggedError<ConfigurationError>()("ConfigurationError", {
   message: Schema.String,
 }) {}
@@ -121,15 +130,15 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
       const decoded = Schema.decodeUnknownSync(applicationSchema, { onExcessProperty: "error" })(value);
       if (!isLoopback(new URL(decoded.publicUrl)) &&
           !(Object.values(decoded.bindings).every((binding) => !!binding.auth)))
-        throw new Error("Anonymous public bindings");
+        throw new ConfigurationError({ message: "Public bindings require bearer authentication" });
       if (!isLoopback(new URL(decoded.publicUrl)) &&
           Object.values(decoded.bindings).some((binding) => binding.auth && new URL(decoded.publicUrl).protocol !== "https:"))
-        throw new Error("Bearer auth requires TLS");
+        throw new ConfigurationError({ message: "Bearer authentication on a public endpoint requires HTTPS" });
       const ids = Object.keys(decoded.bindings);
-      if (ids.some((id) => id === "." || id === "..")) throw new Error("Unsafe binding identity");
-      if (!ids.length) throw new Error("No bindings");
+      if (ids.some((id) => id === "." || id === "..")) throw new ConfigurationError({ message: "Binding identity is invalid" });
+      if (!ids.length) throw new ConfigurationError({ message: "Configuration must define at least one binding" });
       if (ids.length > 1 && ids.some((id) => decoded.bindings[id]?.path === ""))
-        throw new Error("Root bindings cannot be combined with other bindings");
+        throw new ConfigurationError({ message: "Root bindings cannot be combined with mounted bindings" });
       const paths = new Set<string>();
       const statePaths: string[] = [];
       const bindings = ids.map((id): ApplicationBindingConfig => {
@@ -137,50 +146,51 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
         const backendConfig = Object.hasOwn(decoded.connections, raw.connection)
           ? decoded.connections[raw.connection]
           : undefined;
-        if (!backendConfig) throw new Error("Unknown connection");
+        if (!backendConfig) throw new ConfigurationError({ message: "A binding references an unknown connection" });
         const pathKey = raw.path.toLowerCase();
         if (["/healthz", "/.well-known/agent-card.json", "/rpc"].includes(pathKey) ||
             paths.has(pathKey) || [...paths].some((prior) => prior.startsWith(`${pathKey}/`) || pathKey.startsWith(`${prior}/`)))
-          throw new Error("Colliding route");
+          throw new ConfigurationError({ message: "Binding routes collide with each other or a reserved endpoint" });
         paths.add(pathKey);
         const prefix = decoded.publicUrl.replace(/\/$/, "");
         const publicUrl = raw.path ? `${prefix}${raw.path}` : decoded.publicUrl;
-        if (!raw.auth && !isLoopback(new URL(publicUrl))) throw new Error("Anonymous public binding");
+        if (!raw.auth && !isLoopback(new URL(publicUrl))) throw new ConfigurationError({ message: "Public bindings require bearer authentication" });
         if (raw.auth && new URL(publicUrl).protocol !== "https:" && !isLoopback(new URL(publicUrl)))
-          throw new Error("Bearer auth on non-TLS endpoint");
+          throw new ConfigurationError({ message: "Bearer authentication on a public endpoint requires HTTPS" });
         const directory = raw.stateDirectory ?? decoded.stateDirectory;
         const resolvedStateDirectory = directory
           ? (raw.stateDirectory ? directory : `${directory.replace(/\/$/, "")}/${id}`)
           : undefined;
         if (resolvedStateDirectory && statePaths.some((prior) => pathsOverlap(prior, resolvedStateDirectory)))
-          throw new Error("Durable state directories overlap");
+          throw new ConfigurationError({ message: "Durable state directories must be separate" });
         if (resolvedStateDirectory) statePaths.push(resolvedStateDirectory);
-        return { id, path: raw.path, publicUrl: publicUrl.endsWith("/") ? publicUrl : `${publicUrl}/`,
-          agentId: raw.agentId, name: raw.name ?? "Letta A2A Agent", backend: backendConfig,
-          port: decoded.port, ...(raw.cwd ? { cwd: raw.cwd } : {}), peers: normalizePeers(raw.peers),
-          ...(resolvedStateDirectory ? { stateDirectory: resolvedStateDirectory } : {}),
-          ...(raw.auth ? { auth: raw.auth } : {}) };
+        return normalizeBinding(id, raw.path, publicUrl, raw.agentId, raw.name ?? "Letta A2A Agent",
+          backendConfig, decoded.port, raw.peers, { ...(raw.cwd ? { cwd: raw.cwd } : {}),
+            ...(resolvedStateDirectory ? { stateDirectory: resolvedStateDirectory } : {}), ...(raw.auth ? { auth: raw.auth } : {}) });
       });
       return { port: decoded.port, publicUrl: decoded.publicUrl, bindings };
     }
     const legacy = Schema.decodeUnknownSync(serverConfigSchema, { onExcessProperty: "error" })(value);
-    return { port: legacy.port, publicUrl: legacy.publicUrl, bindings: [{
-      id: "default", path: "", publicUrl: legacy.publicUrl, agentId: legacy.agentId,
-      name: legacy.name, backend: legacy.backend, port: legacy.port,
-      ...(legacy.cwd ? { cwd: legacy.cwd } : {}), peers: normalizePeers(legacy.peers),
-      ...(legacy.stateDirectory ? { stateDirectory: legacy.stateDirectory } : {}),
-    }] };
-  } catch {
+    return { port: legacy.port, publicUrl: legacy.publicUrl, bindings: [normalizeBinding("default", "", legacy.publicUrl,
+      legacy.agentId, legacy.name, legacy.backend, legacy.port, legacy.peers,
+      { ...(legacy.cwd ? { cwd: legacy.cwd } : {}), ...(legacy.stateDirectory ? { stateDirectory: legacy.stateDirectory } : {}) })] };
+  } catch (error) {
+    if (error instanceof ConfigurationError) throw error;
     throw new ConfigurationError({ message: "Invalid server configuration" });
   }
 }
 
-export const loadApplicationConfig = Effect.fn("loadApplicationConfig")(function*(path: string):
-  Effect.fn.Return<ApplicationConfig, ConfigurationError, FileSystem.FileSystem> {
+function* loadJson(path: string): Effect.fn.Return<unknown, ConfigurationError, FileSystem.FileSystem> {
   const fs = yield* FileSystem.FileSystem;
   const text = yield* fs.readFileString(path).pipe(Effect.mapError(() => new ConfigurationError({ message: "Unable to read configuration file" })));
-  const value: unknown = yield* Effect.try({ try: () => JSON.parse(text) as unknown, catch: () => new ConfigurationError({ message: "Invalid configuration JSON" }) });
-  return yield* Effect.try({ try: () => parseApplicationConfig(value), catch: () => new ConfigurationError({ message: "Invalid server configuration" }) });
+  return yield* Effect.try({ try: () => JSON.parse(text) as unknown, catch: () => new ConfigurationError({ message: "Invalid configuration JSON" }) });
+}
+
+export const loadApplicationConfig = Effect.fn("loadApplicationConfig")(function*(path: string):
+  Effect.fn.Return<ApplicationConfig, ConfigurationError, FileSystem.FileSystem> {
+  const value = yield* loadJson(path);
+  return yield* Effect.try({ try: () => parseApplicationConfig(value), catch: (error) =>
+    error instanceof ConfigurationError ? error : new ConfigurationError({ message: "Invalid server configuration" }) });
 });
 
 function isLoopback(url: URL): boolean {
@@ -222,13 +232,7 @@ export function validatePeerAliases(peers: ServerConfig["peers"], env: NodeJS.Pr
 export const loadConfig = Effect.fn("loadConfig")(function*(
   path: string,
 ): Effect.fn.Return<ServerConfig, ConfigurationError, FileSystem.FileSystem> {
-  const fs = yield* FileSystem.FileSystem;
-  const text = yield* fs.readFileString(path).pipe(Effect.mapError(() =>
-    new ConfigurationError({ message: "Unable to read configuration file" })));
-  const value: unknown = yield* Effect.try({
-    try: () => JSON.parse(text) as unknown,
-    catch: () => new ConfigurationError({ message: "Invalid configuration JSON" }),
-  });
+  const value = yield* loadJson(path);
   return yield* Schema.decodeUnknownEffect(serverConfigSchema, { onExcessProperty: "error" })(value).pipe(
     Effect.mapError(() => new ConfigurationError({ message: "Invalid server configuration" })),
   );

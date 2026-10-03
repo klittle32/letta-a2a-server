@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { Effect, Exit, Scope } from "effect";
+import { expect, spyOn, test } from "bun:test";
+import { Cause, Effect, Exit, Scope } from "effect";
 import type { CreateSessionOptions, LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AGENT_CARD_PATH } from "@a2a-js/sdk";
 import { Role } from "@a2a-js/sdk";
@@ -294,29 +294,134 @@ test("direct discovery and two turns use an existing agent and preserve conversa
   }
 }, 15000);
 
-test("execution deadline aborts both memory and durable-profile runners", async () => {
-  for (const profile of ["memory", "durable"] as const) {
+test("application deadline aborts sent memory and SQLite-backed sessions", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const originalTimeout = AbortSignal.timeout;
+  const root = await mkdtemp(join(tmpdir(), "a2a-deadline-"));
+  try { for (const durable of [false, true]) {
     let aborted = false;
-    let finish!: () => void;
-    const waiting = new Promise<void>((resolve) => { finish = resolve; });
+    let closed = false;
+    let disposed = false;
+    let sent = false;
+    let sessionStarted!: () => void;
+    const started = new Promise<void>((resolve) => { sessionStarted = resolve; });
+    let abortSession!: () => void;
+    const abortedSession = new Promise<void>((resolve) => { abortSession = resolve; });
     const client = {
+      agents: { async retrieve(id: string) { return { id }; } },
       createSession: () => ({
         async ready() { return { conversationId: "deadline-conversation" }; },
-        async send() {}, async abort() { aborted = true; finish(); },
-        async *stream() { await waiting; },
-        async [Symbol.asyncDispose]() {},
+        async send() { sent = true; sessionStarted(); }, async abort() { aborted = true; abortSession(); },
+        async *stream() { await abortedSession; yield { type: "result", success: true, result: "stopped", durationMs: 1, conversationId: "deadline-conversation" }; },
+        async [Symbol.asyncDispose]() { disposed = true; },
       }),
       resumeSession: () => { throw new Error("Unexpected resume"); },
+      async close() { closed = true; },
     } as unknown as LettaAgentClient;
-    const runner = new AgentSdkTurnRunner(client, "agent", { sharingDomain: profile, sessionOptions: {} });
-    const bounded = withTurnDeadline(runner, 25);
-    const request = {
-      a2aContextId: "context", messageId: "message", text: "wait", signal: new AbortController().signal,
-      onAssistantText() {},
-    };
-    await expect(bounded.runTurn(request)).rejects.toThrow();
-    expect(aborted).toBe(true);
+    const config = parseApplicationConfig({ agentId: "deadline-agent", backend: { type: "local" }, port: 0,
+      publicUrl: "http://127.0.0.1:0", ...(durable ? { stateDirectory: join(root, "sqlite") } : {}) });
+    const scope = await Effect.runPromise(Scope.make());
+    const server = await Effect.runPromise(startApplicationServer(config, () => client).pipe(Effect.provideService(Scope.Scope, scope)));
+    const remote = createA2AClient({ routes: { target: server.bindings.default! }, pollIntervalMs: 5 });
+    const timeout = spyOn(AbortSignal, "timeout");
+    try {
+      let fireDeadline!: () => void;
+      const deadline = new AbortController();
+      const deadlineSignal = deadline.signal;
+      timeout.mockImplementation((ms) => {
+        if (ms === 120_000) { fireDeadline = () => deadline.abort(new Error("deadline")); return deadlineSignal; }
+        return originalTimeout.call(AbortSignal, ms);
+      });
+      const invocation = remote.invoke({ target: "target", message: "wait", localScope: "deadline", signal: new AbortController().signal });
+      // A failed assertion must still leave shutdown free to reject this call.
+      void invocation.catch(() => undefined);
+      await started;
+      expect(sent).toBe(true);
+      expect(fireDeadline).toBeTypeOf("function");
+      fireDeadline();
+      await expect(invocation).rejects.toThrow();
+      expect(aborted).toBe(true);
+      expect(disposed).toBe(true);
+    } finally {
+      timeout.mockRestore();
+      remote.close();
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+      expect(closed).toBe(true); // Application factory clients belong to the launcher scope.
+    }
+  } } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("expected peer configuration errors fail in the typed channel", async () => {
+  const client = { agents: { async retrieve(id: string) { return { id }; } }, async close() {} } as unknown as LettaAgentClient;
+  const peerConfig = parseConfig({ agentId: "agent", backend: { type: "local" }, port: 0, peers: { helper: {
+    url: "http://peer.example/", auth: { tokenEnv: "MISSING_PEER_TOKEN", owner: "peer" },
+  } } });
+  const peerExit = await Effect.runPromiseExit(Effect.scoped(startServer(peerConfig, client)));
+  expect(Exit.isFailure(peerExit)).toBe(true);
+  if (Exit.isFailure(peerExit)) {
+    expect(Cause.hasFails(peerExit.cause)).toBe(true);
+    expect(Cause.hasDies(peerExit.cause)).toBe(false);
+    expect(Cause.squash(peerExit.cause)).toMatchObject({ _tag: "PeerConfigurationError" });
   }
+});
+
+for (const kind of ["peer", "inbound"] as const) {
+  test(`application ${kind} configuration failure is typed and closes only acquired clients`, async () => {
+    let created = 0;
+    let closed = 0;
+    const auth = { tokenEnv: "MISSING_A2A_TOKEN", owner: "test" };
+    const config = parseApplicationConfig({
+      port: 0,
+      publicUrl: "http://127.0.0.1:0/",
+      connections: { local: { type: "local" } },
+      bindings: { test: {
+        path: "", connection: "local", agentId: "existing-agent",
+        ...(kind === "inbound" ? { auth } : { peers: { helper: { url: "http://127.0.0.1:9", auth } } }),
+      } },
+    });
+    const createClient = () => {
+      created++;
+      return {
+        agents: { async retrieve(id: string) { return { id }; } },
+        async close() { closed++; },
+      } as unknown as LettaAgentClient;
+    };
+    const exit = await Effect.runPromiseExit(Effect.scoped(
+      startApplicationServer(config, createClient, "127.0.0.1", {}),
+    ));
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (Exit.isFailure(exit)) {
+      expect(Cause.hasFails(exit.cause)).toBe(true);
+      expect(Cause.hasDies(exit.cause)).toBe(false);
+      expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "PeerConfigurationError" });
+    }
+    expect(created).toBe(kind === "peer" ? 0 : 1);
+    expect(closed).toBe(created);
+  });
+}
+
+test("turn deadline retains an incoming A2A abort signal", async () => {
+  let aborted = false;
+  let finish!: () => void;
+  const waiting = new Promise<void>((resolve) => { finish = resolve; });
+  let begin!: () => void;
+  const started = new Promise<void>((resolve) => { begin = resolve; });
+  const client = { createSession: () => ({
+    async ready() { begin(); return { conversationId: "incoming" }; }, async send() {},
+    async abort() { aborted = true; finish(); }, async *stream() { await waiting; },
+    async [Symbol.asyncDispose]() {},
+  }), resumeSession() { throw new Error("Unexpected resume"); } } as unknown as LettaAgentClient;
+  const runner = new AgentSdkTurnRunner(client, "agent", { sharingDomain: "incoming", sessionOptions: {} });
+  const controller = new AbortController();
+  const pending = withTurnDeadline(runner, 120_000).runTurn({ a2aContextId: "context", messageId: "message", text: "wait", signal: controller.signal, onAssistantText() {} });
+  await started;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort(new Error("caller cancelled"));
+  await expect(pending).rejects.toThrow();
+  expect(controller.signal.aborted).toBe(true);
+  expect(aborted).toBe(true);
 });
 
 test("one listener mounts independent bindings under a public prefix and protects bearer routes", async () => {

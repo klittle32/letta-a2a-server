@@ -162,6 +162,22 @@ describe("server configuration", () => {
       expect(JSON.stringify(error)).not.toContain("secret-marker");
     }
   });
+
+  test("returns actionable public-safe errors for common binding mistakes", () => {
+    expect(() => parseApplicationConfig({ connections: {}, bindings: {} })).toThrow("at least one binding");
+    expect(() => parseApplicationConfig({ publicUrl: "https://example.test", connections: { local: { type: "local" } },
+      bindings: { a: { path: "/a", connection: "missing", agentId: "a", auth: { tokenEnv: "TOKEN", owner: "owner" } } } })).toThrow("unknown connection");
+  });
+
+  test("unknown TLS key remains a schema error and does not masquerade as an HTTPS failure", () => {
+    expect(() => parseConfig({ ...base, TLS: "secret-marker" })).toThrow("Invalid server configuration");
+    try { parseConfig({ ...base, TLS: "secret-marker" }); }
+    catch (error) {
+      expect(error).toBeInstanceOf(ConfigurationError);
+      expect(JSON.stringify(error)).not.toContain("secret-marker");
+      expect((error as ConfigurationError).message).not.toContain("HTTPS");
+    }
+  });
   test("binds an existing agent and defaults to direct loopback", () => {
     const config = parseConfig(base);
     expect(config.agentId).toBe("agent-example");
