@@ -182,6 +182,148 @@ test("restart never publishes provisional text from an unresolved turn", async (
   }
 });
 
+test("SDK observations use keyed correlation and ignore irrelevant payloads", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-observe-work-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "observe-work" });
+    const context = new ServerCallContext();
+    const records = binding["storage"].records.bind(binding["storage"]);
+    const load = binding["storage"].load.bind(binding["storage"]);
+    const getRecord = binding["storage"].getRecord.bind(binding["storage"]);
+    let executionScans = 0;
+    let executionReads = 0;
+    let executionWrites = 0;
+    let taskLoads = 0;
+    binding["storage"].records = ((collection: string) => {
+      if (collection === "executions") executionScans++;
+      return records(collection);
+    }) as typeof binding["storage"]["records"];
+    binding["storage"].getRecord = ((collection: string, key: string) => {
+      if (collection === "executions") executionReads++;
+      return getRecord(collection, key);
+    }) as typeof binding["storage"]["getRecord"];
+    binding["storage"].load = (async (...args: Parameters<typeof binding["storage"]["load"]>) => {
+      taskLoads++;
+      return load(...args);
+    }) as typeof binding["storage"]["load"];
+    const setRecord = binding["storage"]["setRecord"].bind(binding["storage"]);
+    binding["storage"].setRecord = ((collection: string, key: string, value: unknown) => {
+      if (collection === "executions") executionWrites++;
+      return setRecord(collection, key, value);
+    }) as typeof binding["storage"]["setRecord"];
+
+    for (let i = 0; i < 100; i++) {
+      const message = Message.fromJSON({ messageId: `noise-${i}`, role: "user", parts: [{ text: "hi" }] });
+      const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, `task-${i}`, `context-${i}`, context);
+      const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+      await binding.accept(request, initial, `artifact-${i}`);
+    }
+    const message = Message.fromJSON({ messageId: "observed-message", role: "user", parts: [{ text: "hi" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "observed-task", "observed-context", context);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "observed-artifact");
+    const turn = { taskId: request.taskId, a2aContextId: executionContextKey(request), messageId: message.messageId, text: "hi", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+    const executionKey = JSON.stringify([JSON.parse(turn.a2aContextId)[0], JSON.parse(turn.a2aContextId)[1], message.messageId]);
+    executionScans = 0;
+    executionReads = 0;
+    taskLoads = 0;
+    const before = executionWrites;
+    for (let i = 0; i < 4; i++) {
+      await binding.execution.observe!(turn, { type: "loop_status", activeRunIds: [], status: "running" });
+      await binding.execution.observe!(turn, { type: "assistant", content: `PRIVATE assistant ${i}`, uuid: `assistant-${i}` });
+      await binding.execution.observe!(turn, { type: "result", success: true, result: `PRIVATE result ${i}`, durationMs: 1, conversationId: "conversation", stopReason: "end_turn", runIds: [] });
+    }
+    await binding.execution.observe!(turn, { type: "loop_status", activeRunIds: ["run-new"], status: "running" });
+    const afterNewRun = executionWrites;
+    await binding.execution.observe!(turn, { type: "loop_status", activeRunIds: ["run-new"], status: "running" });
+
+    expect(executionScans).toBe(0);
+    expect(executionReads).toBe(14);
+    expect(taskLoads).toBe(0);
+    expect(executionWrites).toBe(before + 1);
+    expect(executionWrites).toBe(afterNewRun);
+    const persisted = getRecord<{ runIds: string[]; publicChunks: string[]; resultText?: string }>("executions", executionKey);
+    expect(persisted?.runIds).toEqual(["run-new"]);
+    expect(persisted?.publicChunks).toEqual([]);
+    expect(persisted?.resultText).toBeUndefined();
+    expect(JSON.stringify(persisted)).not.toContain("PRIVATE");
+    await binding.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "observe-work" });
+    const retained = reopened["storage"].getRecord<{ runIds: string[] }>("executions", executionKey);
+    expect(retained?.runIds).toEqual(["run-new"]);
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SDK turn correlation fails closed for mismatched and malformed keys", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-correlation-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "correlation" });
+    const context = new ServerCallContext({ user: { isAuthenticated: true, userName: "owner-a" }, tenant: "tenant-a" });
+    const message = Message.fromJSON({ messageId: "correlation-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "tenant-a", configuration: undefined, metadata: undefined, message }, "correlation-task", "correlation-context", context);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "correlation-artifact");
+    const key = executionContextKey(request);
+    const turn = { taskId: request.taskId, a2aContextId: key, messageId: message.messageId, text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+    await binding.execution.observe!(turn, { type: "loop_status", activeRunIds: [], status: "running" });
+    const { taskId: _taskId, ...withoutTaskId } = turn;
+    await expect(binding.execution.observe!(withoutTaskId, { type: "loop_status", activeRunIds: [], status: "running" })).resolves.toBeUndefined();
+    for (const invalid of [
+      JSON.stringify(["owner-b", "tenant-a", request.contextId]),
+      JSON.stringify(["owner-a", "tenant-b", request.contextId]),
+      JSON.stringify(["owner-a", "tenant-a", "other-context"]),
+      "not-json",
+      JSON.stringify(["owner-a", "tenant-a"]),
+      JSON.stringify(["owner-a", "tenant-a", 123]),
+    ]) {
+      await expect(binding.execution.observe!({ ...turn, a2aContextId: invalid }, { type: "loop_status", activeRunIds: [], status: "running" })).rejects.toThrow("Missing durable turn correlation");
+    }
+    await expect(binding.execution.observe!({ ...turn, taskId: "other-task" }, { type: "loop_status", activeRunIds: [], status: "running" })).rejects.toThrow("Missing durable turn correlation");
+    await binding.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("oversized settled answers and run IDs remain bounded without provisional journaling", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-budget-"));
+  const binding = await DurableBinding.open({ directory: root, bindingId: "budget", maxRecordBytes: 1024 });
+  try {
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "budget-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "budget-task", "budget-context", context);
+    await binding.accept(request, Task.fromJSON({ id: request.taskId, contextId: request.contextId,
+      status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] }), "budget-artifact");
+    await binding.dispatched(request);
+    const turn = { taskId: request.taskId, a2aContextId: executionContextKey(request), messageId: message.messageId,
+      text: "hello", signal: new AbortController().signal, onAssistantText() {} };
+    await binding.execution.beforeSend!(turn, { agentId: "budget-agent", conversationId: "budget-conversation", otid: message.messageId });
+    const oversized = "PRIVATE".repeat(1024);
+    await expect(binding.execution.observe!(turn, { type: "assistant", content: oversized, uuid: "answer" })).resolves.toBeUndefined();
+    await expect(binding.execution.observe!(turn, { type: "loop_status", activeRunIds: [oversized], status: "running" })).rejects.toThrow("Durable record size limit reached");
+    await expect(binding.execution.stopped!(turn, oversized)).rejects.toThrow("Durable record size limit reached");
+    await binding.execution.unresolved!(turn);
+    await binding.close();
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "budget", maxRecordBytes: 1024 });
+    try {
+      const recovered = await reopened.taskStore.load(request.taskId, context);
+      expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+      expect(recovered?.artifacts ?? []).toHaveLength(0);
+      expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+      await expect(reopened.taskStore.save(Task.fromJSON({ id: request.taskId, contextId: request.contextId,
+        status: { state: TaskState.TASK_STATE_COMPLETED }, artifacts: [{ artifactId: "oversized", parts: [{ text: oversized }] }] }), context))
+        .rejects.toThrow("Durable record size limit reached");
+    } finally { await reopened.close(); }
+  } finally {
+    await binding.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("runner cancellation during owned cleanup recovers without an answer", async () => {
   const root = await mkdtemp(join(tmpdir(), "a2a-durable-cleanup-cancel-"));
   try {
@@ -233,7 +375,7 @@ test("runner cancellation during owned cleanup recovers without an answer", asyn
 test("runner and SQLite recovery share the filtered final answer boundary", async () => {
   const root = await mkdtemp(join(tmpdir(), "a2a-durable-final-answer-"));
   try {
-    const binding = await DurableBinding.open({ directory: root, bindingId: "final-answer-binding" });
+    const binding = await DurableBinding.open({ directory: root, bindingId: "final-answer-binding", maxRecordBytes: 1024 });
     binding.bindAgent("final-answer-agent", "local");
     const context = new ServerCallContext();
     const message = Message.fromJSON({ messageId: "final-answer-message", role: "user", parts: [{ text: "hello" }] });
@@ -260,6 +402,11 @@ test("runner and SQLite recovery share the filtered final answer boundary", asyn
         sessionOptions: () => ({ options: {}, close() { cleaned = true; } }) });
     await runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
       text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} });
+    const executionKey = JSON.stringify([JSON.parse(contextKey)[0], JSON.parse(contextKey)[1], message.messageId]);
+    const stopped = binding["storage"].getRecord<{ eligibleAnswer?: string; publicChunks: string[]; resultText?: string }>("executions", executionKey);
+    expect(stopped?.eligibleAnswer).toBe("Final answer");
+    expect(stopped?.publicChunks).toEqual([]);
+    expect(stopped?.resultText).toBeUndefined();
     expect(cleaned).toBe(true);
     await binding.close();
 
@@ -268,6 +415,10 @@ test("runner and SQLite recovery share the filtered final answer boundary", asyn
     expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
     expect(JSON.stringify(recovered)).toContain("Final answer");
     expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+    const publication = reopened["storage"].getRecord("publications", executionKey);
+    expect(publication).toBeDefined();
+    expect(JSON.stringify(publication)).toContain("Final answer");
+    expect(JSON.stringify(publication)).not.toContain("PRIVATE");
     await reopened.close();
   } finally {
     await rm(root, { recursive: true, force: true });

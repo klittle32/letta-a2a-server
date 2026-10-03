@@ -1,7 +1,8 @@
 import { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
+import { pathToFileURL } from "node:url";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Effect } from "effect";
-import { ConfigurationError, loadApplicationConfig, sdkOptions } from "./config.js";
+import { ConfigurationError, SdkConfigurationError, loadApplicationConfig, sdkOptions } from "./config.js";
 import { ServerStartupError, startApplicationServer } from "./server.js";
 import type { ApplicationBindingConfig } from "./config.js";
 
@@ -19,7 +20,8 @@ export const applicationProgram = (
     for (const binding of config.bindings) {
       yield* Effect.try({
         try: () => sdkOptions(binding.backend, env),
-        catch: () => new ConfigurationError({ message: "Unable to resolve SDK backend configuration" }),
+        catch: (error) => new ConfigurationError({ message: error instanceof SdkConfigurationError
+          ? error.message : "Unable to resolve SDK backend configuration" }),
       });
     }
     const construct = createClient ?? ((binding: ApplicationBindingConfig) => new LettaAgentClient(sdkOptions(binding.backend, env)));
@@ -32,5 +34,5 @@ export const applicationProgram = (
 
 // NodeRuntime interrupts the main fiber on SIGINT/SIGTERM and awaits scoped
 // finalizers, including each SDK client, each bridge, and the shared listener.
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href)
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   NodeRuntime.runMain(applicationProgram().pipe(Effect.provide(NodeServices.layer)));

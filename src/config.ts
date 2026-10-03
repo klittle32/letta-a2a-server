@@ -1,6 +1,6 @@
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { resolve } from "node:path";
-import { Effect, FileSystem, Schema, SchemaTransformation } from "effect";
+import { Effect, FileSystem, Schema, SchemaIssue, SchemaTransformation } from "effect";
 
 const nonEmpty = Schema.String.check(Schema.isMinLength(1));
 const identity = Schema.Trim.check(Schema.isMinLength(1));
@@ -116,18 +116,61 @@ export class ConfigurationError extends Schema.TaggedError<ConfigurationError>()
   message: Schema.String,
 }) {}
 
-export function parseConfig(value: unknown): ServerConfig {
-  try {
-    return Schema.decodeUnknownSync(serverConfigSchema, { onExcessProperty: "error" })(value);
-  } catch {
-    throw new ConfigurationError({ message: "Invalid server configuration" });
+function issueDetails(issue: SchemaIssue.Issue): Array<{ path: string; reason: string }> {
+  const allowed = new Set(["agentId", "name", "backend", "type", "harnessBackend", "url", "tokenEnv", "apiKeyEnv",
+    "computer", "deviceId", "owner", "auth", "cwd", "port", "publicUrl", "stateDirectory", "peers", "connections",
+    "bindings", "path", "connection"]);
+  const walk = (current: SchemaIssue.Issue, path: string, budget: { left: number }): Array<{ path: string; reason: string }> => {
+    if (budget.left <= 0) return [];
+    const one = (reason: string) => { budget.left--; return [{ path: path || "configuration", reason }]; };
+    switch (current._tag) {
+      case "Pointer": {
+        const next: string = current.path.reduce<string>((result, part) => {
+          if (typeof part !== "string") return `${result || "configuration"}.[entry]`;
+          const safePart = allowed.has(part) ? part : "[property]";
+          return result ? `${result}.${safePart}` : safePart;
+        }, path);
+        return walk(current.issue, next, budget);
+      }
+      case "Composite": {
+        const out: Array<{ path: string; reason: string }> = [];
+        for (const child of current.issues) {
+          if (budget.left <= 0) break;
+          out.push(...walk(child, path, budget));
+        }
+        return out;
+      }
+      case "AnyOf": return one("invalid value");
+      case "Filter": return one("filter constraint");
+      case "MissingKey": return one("missing field");
+      case "UnexpectedKey": return one("unknown property");
+      case "InvalidType": return one("invalid type");
+      default: return one("invalid value");
+    }
+  };
+  return walk(issue, "", { left: 4 });
+}
+
+function decodeConfig<A>(schema: Schema.Codec<A, unknown, never, never>, value: unknown): A {
+  try { return Schema.decodeUnknownSync(schema, { onExcessProperty: "error" })(value); }
+  catch (error) {
+    const issue = isRecord(error) && SchemaIssue.isIssue(error.issue) ? error.issue : error;
+    const details = SchemaIssue.isIssue(issue) ? issueDetails(issue) : [];
+    const message = details.length
+      ? `Invalid server configuration: ${details.map(({ path, reason }) => `${path} (${reason})`).join(", ")}`
+      : "Invalid server configuration";
+    throw new ConfigurationError({ message });
   }
+}
+
+export function parseConfig(value: unknown): ServerConfig {
+  return decodeConfig(serverConfigSchema, value);
 }
 
 export function parseApplicationConfig(value: unknown): ApplicationConfig {
   try {
     if (isRecord(value) && "bindings" in value) {
-      const decoded = Schema.decodeUnknownSync(applicationSchema, { onExcessProperty: "error" })(value);
+      const decoded = decodeConfig(applicationSchema, value);
       if (!isLoopback(new URL(decoded.publicUrl)) &&
           !(Object.values(decoded.bindings).every((binding) => !!binding.auth)))
         throw new ConfigurationError({ message: "Public bindings require bearer authentication" });
@@ -170,7 +213,7 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
       });
       return { port: decoded.port, publicUrl: decoded.publicUrl, bindings };
     }
-    const legacy = Schema.decodeUnknownSync(serverConfigSchema, { onExcessProperty: "error" })(value);
+    const legacy = decodeConfig(serverConfigSchema, value);
     return { port: legacy.port, publicUrl: legacy.publicUrl, bindings: [normalizeBinding("default", "", legacy.publicUrl,
       legacy.agentId, legacy.name, legacy.backend, legacy.port, legacy.peers,
       { ...(legacy.cwd ? { cwd: legacy.cwd } : {}), ...(legacy.stateDirectory ? { stateDirectory: legacy.stateDirectory } : {}) })] };
@@ -212,18 +255,24 @@ export function validatePeerConfiguration(peers: ApplicationBindingConfig["peers
   for (const [alias, peer] of Object.entries(peers)) {
     const url = new URL(peer.url);
     if (peer.auth) {
-      if (url.protocol !== "https:" && !isLoopback(url)) throw new Error("Bearer peer auth requires HTTPS");
+      if (url.protocol !== "https:" && !isLoopback(url)) throw new PeerConfigurationValidationError({ message: "Bearer peer auth requires HTTPS" });
       const token = env[peer.auth.tokenEnv];
-      if (!token?.trim() || /[\r\n]/.test(token)) throw new Error(`Required environment variable ${peer.auth.tokenEnv} is missing or invalid`);
+      if (!token?.trim() || /[\r\n]/.test(token)) throw new PeerConfigurationValidationError({ message: "Required peer credential environment variable is missing or invalid" });
     }
     const signature = JSON.stringify(peer.auth ? [peer.auth.tokenEnv, peer.auth.owner] : null);
     const canonicalEndpoint = url.href;
     const prior = policies.get(canonicalEndpoint);
-    if (prior !== undefined && prior !== signature) throw new Error("Conflicting same-URL peer alias policies");
+    if (prior !== undefined && prior !== signature) throw new PeerConfigurationValidationError({ message: "Conflicting same-URL peer alias policies" });
     policies.set(canonicalEndpoint, signature);
-    if (!alias.trim()) throw new Error("Invalid peer alias");
+    if (!alias.trim()) throw new PeerConfigurationValidationError({ message: "Invalid peer alias" });
   }
 }
+export class PeerConfigurationValidationError extends Schema.TaggedError<PeerConfigurationValidationError>()("PeerConfigurationValidationError", {
+  message: Schema.String,
+}) {}
+export class SdkConfigurationError extends Schema.TaggedError<SdkConfigurationError>()("SdkConfigurationError", {
+  message: Schema.String,
+}) {}
 export function validatePeerAliases(peers: ServerConfig["peers"], env: NodeJS.ProcessEnv): void {
   const normalized = normalizePeers(peers);
   validatePeerConfiguration(normalized, env);
@@ -233,9 +282,10 @@ export const loadConfig = Effect.fn("loadConfig")(function*(
   path: string,
 ): Effect.fn.Return<ServerConfig, ConfigurationError, FileSystem.FileSystem> {
   const value = yield* loadJson(path);
-  return yield* Schema.decodeUnknownEffect(serverConfigSchema, { onExcessProperty: "error" })(value).pipe(
-    Effect.mapError(() => new ConfigurationError({ message: "Invalid server configuration" })),
-  );
+  return yield* Effect.try({
+    try: () => decodeConfig(serverConfigSchema, value),
+    catch: (error) => error instanceof ConfigurationError ? error : new ConfigurationError({ message: "Invalid server configuration" }),
+  });
 });
 
 export function sdkOptions(
@@ -244,7 +294,7 @@ export function sdkOptions(
 ): ConstructorParameters<typeof LettaAgentClient>[0] {
   const secret = (name: string): string => {
     const value = env[name];
-    if (!value?.trim()) throw new Error(`Required environment variable ${name} is missing`);
+    if (!value?.trim()) throw new SdkConfigurationError({ message: "Required backend credential environment variable is missing" });
     return value;
   };
   switch (config.type) {

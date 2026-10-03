@@ -183,27 +183,25 @@ export class DurableBinding {
       },
       observe: async (request, message) => {
         const r = this.turnRecord(request);
-        if (message.type === "assistant") r.publicChunks.push(message.content);
+        let changed = false;
         if (message.type === "loop_status") {
           for (const id of message.activeRunIds)
-            if (!r.runIds.includes(id)) r.runIds.push(id);
+            if (!r.runIds.includes(id)) {
+              r.runIds.push(id);
+              changed = true;
+            }
         }
         if (message.type === "result") {
           for (const id of message.runIds ?? [])
-            if (!r.runIds.includes(id)) r.runIds.push(id);
-          if (message.success) r.resultText = message.result;
+            if (!r.runIds.includes(id)) {
+              r.runIds.push(id);
+              changed = true;
+            }
         }
-        // Account for SDK artifact-part expansion, not just raw chunk strings.
-        const preview = await this.reduce(
-          r,
-          this.recoveryEvents(
-            r,
-            TaskState.TASK_STATE_FAILED,
-            "Execution status is unknown; operator reconciliation is required",
-          ),
-        );
-        this.assertSize(Task.toJSON(preview), 3);
-        this.put(r);
+        // Provisional assistant/result text is deliberately not journaled. Only
+        // run IDs support recovery inspection; settled answer publication is
+        // recorded later at the stopped boundary.
+        if (changed) this.put(r);
       },
       stopped: async (request, eligibleAnswer, canceled) => {
         this.updateTurn(request, (r) => {
@@ -385,13 +383,32 @@ export class DurableBinding {
     this.put(record);
   }
   private turnRecord(request: LettaTurnRequest): RecoveryRecord {
-    const record = this.attempts().find(
-      (r) =>
-        r.contextKey === request.a2aContextId &&
-        r.messageId === request.messageId &&
-        (!request.taskId || r.taskId === request.taskId),
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(request.a2aContextId);
+    } catch {
+      throw new Error("Missing durable turn correlation");
+    }
+    if (
+      !Array.isArray(parsed) ||
+      parsed.length !== 3 ||
+      typeof parsed[0] !== "string" ||
+      typeof parsed[1] !== "string" ||
+      typeof parsed[2] !== "string"
+    )
+      throw new Error("Missing durable turn correlation");
+    const [owner, tenant] = parsed;
+    const record = this.storage.getRecord<RecoveryRecord>(
+      "executions",
+      recordKey(owner, tenant, request.messageId),
     );
-    if (!record) throw new Error("Missing durable turn correlation");
+    if (
+      !record ||
+      record.contextKey !== request.a2aContextId ||
+      record.messageId !== request.messageId ||
+      (request.taskId !== undefined && record.taskId !== request.taskId)
+    )
+      throw new Error("Missing durable turn correlation");
     return record;
   }
   assertAvailable(key: string, messageId?: string): void {

@@ -1,6 +1,6 @@
 # Letta A2A Server — extraction plan
 
-Status: Phases 1–4 are delivered in source at base commit `7890e9c8c7bd732c9c4235634000a84a5da3f055`. The currently approved focused cleanup also includes Effect/source/test fixes. Phase 5 packaging remains pending. Persistent-service activation, package publication, and deployment remain separate decisions.
+Status: Phases 1–4 are implemented; Phase 5 packaging and installed-artifact verification remain pending. This document records the extraction scope and sequence. Use the [README](README.md) for current setup and [Development and support](docs/development.md) for verification limits. Service activation, package publication, and deployment remain separate decisions.
 
 Source: [letta-a2a issue #2](https://github.com/klittle32/letta-a2a/issues/2), reviewed against lab commit `2972081` on October 2, 2026.
 

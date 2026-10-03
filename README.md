@@ -6,6 +6,8 @@ The application uses Effect 4 for configuration, resource ownership, and process
 
 ## Quick start with Docker Compose
 
+Requires Docker Compose and credentials for the two example runtimes. This setup runs both agents in Docker: one with Cloud state and one with local state. For Cloud sandbox or connected-computer execution, choose a different [runtime backend](docs/configuration.md#runtime-backends).
+
 1. Put `LETTA_API_KEY` and `OPENAI_API_KEY` in the ignored project-root `.env`. Compose passes only the Letta key to `server`, and only the OpenAI key to `local`.
 2. Copy the example configurations and set each `agentId` to an existing agent ID available to that service:
 
@@ -36,7 +38,7 @@ The application uses Effect 4 for configuration, resource ownership, and process
    docker compose ps
    ```
 
-The [official Go `a2a` CLI](https://github.com/a2aproject/a2a-cli) can send a message to either service (tested with `0.3.0`):
+For a manual check, install the optional [official Go `a2a` CLI](https://github.com/a2aproject/a2a-cli) (tested with `0.3.0`), then send to either service:
 
 ```sh
 a2a --endpoint http://127.0.0.1:41241/ --transport jsonrpc --timeout 120s send "Hello"

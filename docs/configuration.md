@@ -1,8 +1,16 @@
 # Configuration reference
 
-The server accepts either the legacy single-agent object or the multi-binding application object. JSON is strict: unknown properties and invalid routes are rejected at startup. The shipped files `config.example.json`, `config.cloud.example.json`, and `config.bindings.example.json` are starting points; copy them to ignored local files before adding IDs or credentials.
+The server accepts either the legacy single-agent object or the multi-binding application object. JSON is strict: unknown properties and invalid routes are rejected at startup. Copy an example to an ignored local file, supply existing agent IDs, and keep secret values in the environment—not JSON.
 
-Compose mounts the selected config read-only as `/app/config.local.json`. `A2A_CONFIG_FILE` selects the `server` config (default `./config.cloud.local.json`); `A2A_LOCAL_CONFIG_FILE` selects the `local` config (default `./config.local.json`). The `.env` file supplies Compose variable interpolation. Arbitrary token environment variables must also be explicitly passed to the relevant service; adding a variable to `.env` alone does not inject it into the container.
+| Example | Copy to | Compose use |
+| --- | --- | --- |
+| `config.example.json` | `config.local.json` | `local`: one local-state agent; host port `41242` |
+| `config.cloud.example.json` | `config.cloud.local.json` | `server`: one Cloud-state agent executing in Docker; host port `41241` |
+| `config.bindings.example.json` | `config.local.json` | `local`: two local-state agents at `/agents/first/` and `/agents/second/` |
+
+**Compose:** mounts the selected file read-only as `/app/config.local.json`. `A2A_CONFIG_FILE` selects the `server` config (default `./config.cloud.local.json`); `A2A_LOCAL_CONFIG_FILE` selects the `local` config (default `./config.local.json`). These selectors are Compose-only. `.env` supplies Compose interpolation; extra credential variables must also be explicitly passed to the service. Adding a variable to `.env` alone does not inject it into the container.
+
+**Host execution:** `node dist/main.js ./my-config.json` takes a positional config path, defaulting to `config.local.json`. Named credential variables must be available in the process environment; the server does not automatically load `.env`. Set `publicUrl` to the host listener's actual URL rather than keeping a Docker port mapping.
 
 ## Legacy single-agent form
 
@@ -31,10 +39,14 @@ The backend selects the Letta SDK connection and execution environment. It does 
 | `{"type":"local","harnessBackend":"local"}` | SDK-managed local backend, as used by the Compose `local` service. Its agents live in that service's runtime volume. |
 | `{"type":"local","harnessBackend":"api"}` | SDK-managed App Server using Cloud agent state and models, as used by Compose `server`. Execution still runs in the container; this is not the managed Cloud sandbox. |
 | `{"type":"remote","url":"http://host.docker.internal:8283","tokenEnv":"APP_SERVER_TOKEN"}` | Connect to an already-running App Server. `url` accepts HTTP(S)/WS(S); optional `tokenEnv` names its bearer credential. State, execution machine, and lifecycle belong to that server. |
-| `{"type":"cloud","apiKeyEnv":"LETTA_API_KEY"}` | Letta Cloud backend. `apiKeyEnv` defaults according to the SDK if omitted. |
-| `{"type":"cloud","computer":"device-id"}` | Cloud agent using the selected computer. `computer` may be a string, `{ "deviceId": "..." }`, or `{ "name": "..." }`. `cwd`, if set, belongs to the execution environment. |
+| `{"type":"cloud","apiKeyEnv":"LETTA_API_KEY"}` | Cloud agent state with an SDK-managed Letta Cloud sandbox for execution. Omit `computer` to select this mode. |
+| `{"type":"cloud","apiKeyEnv":"LETTA_API_KEY","computer":{"deviceId":"YOUR_DEVICE_ID"}}` | Cloud agent state with execution on the selected online, compatible connected computer. A stable device ID is recommended. |
 
 Compose's ordinary `server` uses `local` plus `harnessBackend: api`; do not describe this as SDK-managed Cloud sandbox execution. The `local` service uses `local` plus `harnessBackend: local`.
+
+For Cloud connections, `apiKeyEnv` names a credential variable; omitting it leaves credential resolution to the SDK. Compose explicitly passes `LETTA_API_KEY` to `server`. A computer **name** can also be supplied as `"work-laptop"` or `{ "name": "work-laptop" }`; a bare string is not a device ID. The selected computer must be connected to the same account, online, and running a compatible listener. See [runtime evidence and limits](development.md#runtime-evidence-and-limits) for what has actually been exercised.
+
+`cwd` belongs to the execution environment: the local SDK host/container, remote App Server host, Cloud sandbox, or selected connected computer. It does not transfer or mount local files. Session-owned A2A peer tools still execute in this server's SDK process, regardless of the agent's execution target. See the [SDK deployment reference](https://docs.letta.com/agent-sdk/deployment/index.md) for the underlying modes.
 
 ## Several fixed agents on one listener
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effect, FileSystem, Schema } from "effect";
-import { ConfigurationError, loadApplicationConfig, loadConfig, parseApplicationConfig, parseConfig, sdkOptions, serverConfigSchema } from "../src/config.js";
+import { ConfigurationError, loadApplicationConfig, loadConfig, parseApplicationConfig, parseConfig, sdkOptions, serverConfigSchema, validatePeerAliases } from "../src/config.js";
 
 const base = { agentId: "agent-example", backend: { type: "local" } };
 
@@ -149,8 +149,8 @@ describe("server configuration", () => {
     for (const [fs, message] of [
       [FileSystem.makeNoop({}), "Unable to read configuration file"],
       [FileSystem.makeNoop({ readFileString: () => Effect.succeed('{"secret-marker":') }), "Invalid configuration JSON"],
-      [FileSystem.makeNoop({ readFileString: () => Effect.succeed(JSON.stringify({ ...base, apiKey: "secret-marker" })) }),
-        "Invalid server configuration"],
+      [FileSystem.makeNoop({ readFileString: () => Effect.succeed(JSON.stringify({ ...base, extra: "secret-marker" })) }),
+        "Invalid server configuration: [property] (unknown property)"],
     ] as const) {
       const error = await Effect.runPromise(loadConfig("secret-marker.json").pipe(
         Effect.provideService(FileSystem.FileSystem, fs),
@@ -162,6 +162,15 @@ describe("server configuration", () => {
       expect(JSON.stringify(error)).not.toContain("secret-marker");
     }
   });
+  test("loadConfig keeps schema failures in its typed ConfigurationError channel", async () => {
+    const fs = FileSystem.makeNoop({ readFileString: () => Effect.succeed(JSON.stringify({ ...base, backend: { type: "remote" } })) });
+    const error = await Effect.runPromise(loadConfig("config.json").pipe(
+      Effect.provideService(FileSystem.FileSystem, fs), Effect.flip,
+    ));
+    expect(error).toBeInstanceOf(ConfigurationError);
+    expect(error._tag).toBe("ConfigurationError");
+    expect(error.message).toContain("backend (invalid value)");
+  });
 
   test("returns actionable public-safe errors for common binding mistakes", () => {
     expect(() => parseApplicationConfig({ connections: {}, bindings: {} })).toThrow("at least one binding");
@@ -170,12 +179,40 @@ describe("server configuration", () => {
   });
 
   test("unknown TLS key remains a schema error and does not masquerade as an HTTPS failure", () => {
-    expect(() => parseConfig({ ...base, TLS: "secret-marker" })).toThrow("Invalid server configuration");
+    expect(() => parseConfig({ ...base, TLS: "secret-marker" })).toThrow("unknown property");
     try { parseConfig({ ...base, TLS: "secret-marker" }); }
     catch (error) {
       expect(error).toBeInstanceOf(ConfigurationError);
       expect(JSON.stringify(error)).not.toContain("secret-marker");
       expect((error as ConfigurationError).message).not.toContain("HTTPS");
+    }
+  });
+  test("schema diagnostics identify bounded paths and reasons without values", () => {
+    for (const [input, expected] of [
+      [{ ...base, peers: { helper: "file://secret-value" } }, "peers (invalid value)"],
+      [{ ...base, backend: { type: "remote", tokenEnv: "SECRET_ENV" } }, "backend (invalid value)"],
+      [{ ...base, backend: { type: "secret-discriminant" } }, "backend"],
+      [{ ...base, backend: { type: "local", secretField: "secret-value" } }, "backend (invalid value)"],
+    ] as const) {
+      try { parseConfig(input); throw new Error("expected parse failure"); }
+      catch (error) {
+        expect((error as ConfigurationError).message).toContain(expected);
+        expect(JSON.stringify(error)).not.toMatch(/secret-value|SECRET_ENV|secret-discriminant/);
+      }
+    }
+  });
+  test("peer validation exposes safe typed reasons without credential names or causes", () => {
+    const peers = { helper: { url: "https://peer.example", auth: { tokenEnv: "SECRET_PEER_TOKEN", owner: "helper" } } };
+    try { validatePeerAliases(peers, {}); throw new Error("expected peer failure"); }
+    catch (error) {
+      expect((error as Error).message).toContain("environment variable is missing or invalid");
+      expect(String(error)).not.toContain("SECRET_PEER_TOKEN");
+    }
+    const conflict = { ...peers, alternate: { url: "https://peer.example/", auth: { tokenEnv: "OTHER_TOKEN", owner: "other" } } };
+    try { validatePeerAliases(conflict, { SECRET_PEER_TOKEN: "ok", OTHER_TOKEN: "ok" }); throw new Error("expected conflict"); }
+    catch (error) {
+      expect((error as Error).message).toContain("Conflicting same-URL peer alias policies");
+      expect(String(error)).not.toContain("OTHER_TOKEN");
     }
   });
   test("binds an existing agent and defaults to direct loopback", () => {
@@ -193,8 +230,8 @@ describe("server configuration", () => {
     expect(sdkOptions(config.backend, { APP_SERVER_TOKEN: "test-only" })).toEqual({
       backend: "remote", url: "http://host.docker.internal:4500", authToken: "test-only",
     });
-    expect(() => sdkOptions(config.backend, {})).toThrow("APP_SERVER_TOKEN");
-    expect(() => sdkOptions(config.backend, { APP_SERVER_TOKEN: " \t" })).toThrow("APP_SERVER_TOKEN");
+    expect(() => sdkOptions(config.backend, {})).toThrow("backend credential environment variable is missing");
+    expect(() => sdkOptions(config.backend, { APP_SERVER_TOKEN: " \t" })).toThrow("backend credential environment variable is missing");
   });
 
   test("Cloud-backed agents can execute in the local SDK runtime", () => {

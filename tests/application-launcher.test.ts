@@ -1,12 +1,34 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { cp, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Effect, Scope } from "effect";
+import { Effect, FileSystem, Scope } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { applicationProgram } from "../src/main.js";
+
+test.each(["plain directory", "project #1", "project %23"])("CLI starts from a directory named %s", async (name) => {
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  const temporary = await mkdtemp(join(tmpdir(), "letta-a2a-entrypoint-"));
+  const directory = join(temporary, name);
+  try {
+    await cp(join(root, "src"), join(directory, "src"), { recursive: true });
+    await cp(join(root, "package.json"), join(directory, "package.json"));
+    await symlink(join(root, "node_modules"), join(directory, "node_modules"), "junction");
+    // A deliberately missing config proves the real CLI ran, without opening
+    // an SDK connection, starting a service, or needing credentials.
+    const child = spawnSync("node", ["--import", "tsx", join(directory, "src/main.ts"), join(temporary, "missing.json")], {
+      cwd: root, encoding: "utf8", timeout: 5_000, maxBuffer: 256 * 1024,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(1);
+    expect(child.stdout + child.stderr).toContain("Unable to read configuration file");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+}, 10_000);
 
 test("normal CLI program loads multi-binding config and retrieves each configured agent", async () => {
   const directory = await mkdtemp(join(tmpdir(), "letta-a2a-application-"));
@@ -104,4 +126,20 @@ test("default applicationProgram client uses the injected environment", async ()
     captured: { backend: "remote", url: "http://127.0.0.1:1", authToken: "injected-sentinel" },
     failed: true,
   });
+});
+
+test("launcher preserves safe backend credential errors before client creation", async () => {
+  let created = false;
+  const program = applicationProgram("unused.json", () => {
+    created = true;
+    throw new Error("PRIVATE constructor detail must not be reported");
+  }, "127.0.0.1", {}).pipe(
+    Effect.provideService(FileSystem.FileSystem, FileSystem.makeNoop({
+      readFileString: () => Effect.succeed(JSON.stringify({ agentId: "cloud-agent",
+        backend: { type: "cloud", apiKeyEnv: "MISSING_BACKEND_KEY" } })),
+    })),
+    Effect.catchTag("ConfigurationError", (error) => Effect.succeed(error.message)),
+  );
+  expect(await Effect.runPromise(program)).toBe("Required backend credential environment variable is missing");
+  expect(created).toBe(false);
 });

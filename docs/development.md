@@ -2,7 +2,7 @@
 
 ## Toolchain and checks
 
-The October 3 follow-up for [recovery issue #1](https://github.com/klittle32/letta-a2a-server/issues/1) and [pre-send cancellation issue #2](https://github.com/klittle32/letta-a2a-server/issues/2) passes **107 tests / 499 assertions**, Effect compiler checks, build, and the provider-free HTTP fixture. The regressions reproduce against the original code. Compiled Node checks also cover answer filtering and late cancellation across SQLite reopen, plus file-backed unsent rollback and subsequent admission. These use deterministic interruption checkpoints and fake SDK/peer execution, not live-backend crash or cancellation proofs. No live model calls, dependency upgrades, image rebuilds, or persistent-service changes were made.
+The automated suite covers startup, configuration, scoped shutdown, streaming, binding isolation, peer credentials, and recovery. Recovery checks use deterministic interruption checkpoints and fake SDK/peer execution; they are not live-backend crash or cancellation proofs.
 
 The recorded baseline used Node `24.19.0`, npm `11.17.0`, Bun `1.4.2` (test runner only), Letta Agent SDK `0.8.28`, bundled Code `0.34.2`, A2A SDK `1.1.0`, Effect and `@effect/platform-node` `4.0.0`, TypeScript `7.0.2`, and `@effect/tsgo` `0.48.0`. Live trials selected `openai/gpt-5.4-mini` explicitly. These are recorded versions, not a promise that every allowed SDK version was tested.
 
@@ -17,6 +17,8 @@ Provider-free checks in that image require no credentials or network:
 ```sh
 docker run --rm --network none letta-a2a-server:dev npm test
 docker run --rm --network none letta-a2a-server:dev npm run check
+docker run --rm --network none letta-a2a-server:dev npm run build
+docker run --rm --network none letta-a2a-server:dev npm run smoke:live -- --check
 ```
 
 Host development uses npm and the lockfile; Bun is only the test runner:
@@ -33,12 +35,9 @@ For host-native execution, `config.local.json` must select an agent available to
 
 ## Opt-in live fixtures
 
-These commands create disposable agents and make paid model calls. Choose the backend and model explicitly; provide credentials through the environment, not source/config values. `--check` is provider-free and exercises the peer fixture over HTTP.
+Unlike the provider-free `--check` above, these commands create disposable agents and make paid model calls. Choose the backend and model explicitly; provide credentials through the environment, not source/config values.
 
 ```sh
-# Provider-free HTTP fixture check
-docker run --rm --network none letta-a2a-server:dev npm run smoke:live -- --check
-
 # Single-agent local, private remote App Server fixture, and Cloud sandbox
 docker compose run --rm local npm run smoke:live -- local openai/gpt-5.4-mini
 docker compose run --rm local npm run smoke:live -- remote openai/gpt-5.4-mini
@@ -61,7 +60,7 @@ Close owned server/session resources before deleting disposable agents. Cleanup 
 
 ## Runtime evidence and limits
 
-At base commit `7890e9c8c7bd732c9c4235634000a84a5da3f055`, the recorded provider-free baseline was **80 tests / 373 assertions**. The Phase 4 implementation and bounded runtime matrix were delivered; persistent-service activation is separate approval. The earlier persistent local Compose configuration remains the Phase 3 trial, and the Cloud-backed service was not activated as Phase 4.
+The following is historical verification at commit `7890e9c8c7bd732c9c4235634000a84a5da3f055`, not a statement about currently running containers. Phase 4's implementation and bounded runtime checks are delivered. Rebuilding or activating any persistent service is a separate action.
 
 | Runtime check at the base commit | Evidence recorded | Boundary |
 | --- | --- | --- |
@@ -72,7 +71,7 @@ At base commit `7890e9c8c7bd732c9c4235634000a84a5da3f055`, the recorded provider
 | Earlier local API / Cloud identity | Compose Cloud-backed agent executed in Docker: answer, recall, status-first streaming, and retained IDs across service restart. | This is local API execution with Cloud identity, not SDK-managed Cloud sandbox; not an authenticated-peer Phase 4 rerun. |
 | Phase 3 persistent local pair | Host Go CLI trial on local routes: separate recall and task isolation, then streaming turns. | Last persistent local trial; distinct from disposable Phase 4 delegation. |
 
-The smoke fixture's base-commit `--check` had an incorrect ProtoJSON Bearer shape and a weak assertion. It has since been corrected to serialize the Agent Card with SDK `AgentCard.toJSON()` and exercise the protected fixture over actual HTTP, including Bearer enforcement, `private, no-store`, and wrong-token `401`. This fixture defect did not invalidate the separate authenticated route/delegation evidence above. The correction's RED/GREEN checks are recorded with the current code changes, not inferred from the historical assertion.
+The current provider-free fixture checks actual HTTP discovery and invocation, SDK-serialized security metadata, Bearer enforcement, `private, no-store`, and wrong-token `401`. It supersedes the base commit's weaker `--check` assertion; it does not replace live runtime verification.
 
 Still unverified: live backend stop after cancellation; independent Cloud sandbox termination; connected-computer execution (the machine checked October 3 had M1P Desktop Code `0.33.6`, below fixture minimum `0.34.2`); Windows; public TLS/reverse-proxy operation; a remote App Server on a separate host; and live-model crash recovery. Credential reference names do not independently establish the actual backend principal or machine.
 

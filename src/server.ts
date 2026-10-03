@@ -7,7 +7,7 @@ import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AgentSdkTurnRunner, DurableBinding, createBridge, createBridgeRouter } from "./bridge/index.js";
 import { createA2AClient, FileContextStore } from "./client/index.js";
 import { createA2ATools } from "./client/agent-sdk.js";
-import { validatePeerAliases, type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
+import { PeerConfigurationValidationError, validatePeerAliases, type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
 
 export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()("ServerStartupError", {
   message: Schema.String,
@@ -71,7 +71,9 @@ function constantTimeEqual(left: string, right: string): boolean {
 }
 
 const typedPeerValidation = (peers: Parameters<typeof validatePeerAliases>[0], env: NodeJS.ProcessEnv) =>
-  Effect.try({ try: () => validatePeerAliases(peers, env), catch: () => new PeerConfigurationError({ message: "Peer configuration is invalid or incomplete" }) });
+  Effect.try({ try: () => validatePeerAliases(peers, env), catch: (error) => error instanceof PeerConfigurationValidationError
+    ? new PeerConfigurationError({ message: error.message })
+    : new PeerConfigurationError({ message: "Peer configuration is invalid or incomplete" }) });
 
 // Imported promises do not establish backend cancellation. Finalizers await the
 // actual public disposal promises, uninterruptibly, and never retry sent work.
