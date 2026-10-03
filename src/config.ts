@@ -1,4 +1,5 @@
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
+import { resolve } from "node:path";
 import { Effect, FileSystem, Schema, SchemaTransformation } from "effect";
 
 const nonEmpty = Schema.String.check(Schema.isMinLength(1));
@@ -31,14 +32,22 @@ const computer = Schema.Union([
   Schema.Struct({ deviceId: nonEmpty }),
   Schema.Struct({ name: nonEmpty }),
 ]);
+const remoteUrl = Schema.String.check(Schema.makeFilter((value) => {
+  try { const u = new URL(value); return ["http:", "https:", "ws:", "wss:"].includes(u.protocol) && !u.username && !u.password && !u.search && !u.hash; }
+  catch { return false; }
+}));
 const backend = Schema.Union([
   Schema.Struct({
     type: Schema.Literals(["local"]),
     harnessBackend: Schema.optional(Schema.Literals(["api", "local"])),
   }),
-  Schema.Struct({ type: Schema.Literals(["remote"]), url: endpoint, tokenEnv: Schema.optional(envName) }),
+  Schema.Struct({ type: Schema.Literals(["remote"]), url: remoteUrl, tokenEnv: Schema.optional(envName) }),
   Schema.Struct({ type: Schema.Literals(["cloud"]), apiKeyEnv: Schema.optional(envName), computer: Schema.optional(computer) }),
 ]);
+const peerAuthSchema = Schema.Struct({ tokenEnv: envName, owner: identity });
+const peerSchema = Schema.Struct({ url: endpoint, auth: Schema.optional(peerAuthSchema) });
+const peersSchema = Schema.Record(nonEmpty, Schema.Union([endpoint, peerSchema]));
+const stateDirectory = nonEmpty;
 export const serverConfigSchema = Schema.Struct({
   agentId: identity,
   name: identity.pipe(Schema.withDecodingDefaultType(Effect.succeed("Letta A2A Agent"))),
@@ -47,7 +56,8 @@ export const serverConfigSchema = Schema.Struct({
   port: Schema.Finite.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: 65535 }))
     .pipe(Schema.withDecodingDefaultType(Effect.succeed(41241))),
   publicUrl: publicUrl.pipe(Schema.withDecodingDefaultType(Effect.succeed("http://127.0.0.1:41241/"))),
-  peers: Schema.Record(nonEmpty, endpoint).pipe(
+  stateDirectory: Schema.optional(stateDirectory),
+  peers: peersSchema.pipe(
     Schema.withDecodingDefaultType(Effect.sync(() => ({})))),
 });
 
@@ -67,12 +77,14 @@ const bindingSchema = Schema.Struct({
   agentId: identity,
   name: Schema.optional(identity),
   cwd: Schema.optional(nonEmpty),
-  peers: Schema.Record(nonEmpty, endpoint).pipe(Schema.withDecodingDefaultType(Effect.sync(() => ({})))),
+  stateDirectory: Schema.optional(stateDirectory),
+  peers: peersSchema.pipe(Schema.withDecodingDefaultType(Effect.sync(() => ({})))),
   auth: Schema.optional(authSchema),
 });
 const applicationSchema = Schema.Struct({
   port: Schema.Finite.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: 65535 })).pipe(Schema.withDecodingDefaultType(Effect.succeed(41241))),
   publicUrl: applicationUrl.pipe(Schema.withDecodingDefaultType(Effect.succeed("http://127.0.0.1:41241/"))),
+  stateDirectory: Schema.optional(stateDirectory),
   connections: Schema.Record(bindingId, backend),
   bindings: Schema.Record(bindingId, bindingSchema),
 });
@@ -85,7 +97,8 @@ export type ApplicationBindingConfig = {
   backend: ServerConfig["backend"];
   port: number;
   cwd?: string;
-  peers: Record<string, string>;
+  peers: Record<string, { url: string; auth?: { tokenEnv: string; owner: string } | undefined }>;
+  stateDirectory?: string;
   auth?: { tokenEnv: string; owner: string };
 };
 export interface ApplicationConfig { port: number; publicUrl: string; bindings: ApplicationBindingConfig[] }
@@ -113,10 +126,12 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
           Object.values(decoded.bindings).some((binding) => binding.auth && new URL(decoded.publicUrl).protocol !== "https:"))
         throw new Error("Bearer auth requires TLS");
       const ids = Object.keys(decoded.bindings);
+      if (ids.some((id) => id === "." || id === "..")) throw new Error("Unsafe binding identity");
       if (!ids.length) throw new Error("No bindings");
       if (ids.length > 1 && ids.some((id) => decoded.bindings[id]?.path === ""))
         throw new Error("Root bindings cannot be combined with other bindings");
       const paths = new Set<string>();
+      const statePaths: string[] = [];
       const bindings = ids.map((id): ApplicationBindingConfig => {
         const raw = decoded.bindings[id]!;
         const backendConfig = Object.hasOwn(decoded.connections, raw.connection)
@@ -133,9 +148,17 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
         if (!raw.auth && !isLoopback(new URL(publicUrl))) throw new Error("Anonymous public binding");
         if (raw.auth && new URL(publicUrl).protocol !== "https:" && !isLoopback(new URL(publicUrl)))
           throw new Error("Bearer auth on non-TLS endpoint");
+        const directory = raw.stateDirectory ?? decoded.stateDirectory;
+        const resolvedStateDirectory = directory
+          ? (raw.stateDirectory ? directory : `${directory.replace(/\/$/, "")}/${id}`)
+          : undefined;
+        if (resolvedStateDirectory && statePaths.some((prior) => pathsOverlap(prior, resolvedStateDirectory)))
+          throw new Error("Durable state directories overlap");
+        if (resolvedStateDirectory) statePaths.push(resolvedStateDirectory);
         return { id, path: raw.path, publicUrl: publicUrl.endsWith("/") ? publicUrl : `${publicUrl}/`,
           agentId: raw.agentId, name: raw.name ?? "Letta A2A Agent", backend: backendConfig,
-          port: decoded.port, ...(raw.cwd ? { cwd: raw.cwd } : {}), peers: raw.peers,
+          port: decoded.port, ...(raw.cwd ? { cwd: raw.cwd } : {}), peers: normalizePeers(raw.peers),
+          ...(resolvedStateDirectory ? { stateDirectory: resolvedStateDirectory } : {}),
           ...(raw.auth ? { auth: raw.auth } : {}) };
       });
       return { port: decoded.port, publicUrl: decoded.publicUrl, bindings };
@@ -144,7 +167,8 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
     return { port: legacy.port, publicUrl: legacy.publicUrl, bindings: [{
       id: "default", path: "", publicUrl: legacy.publicUrl, agentId: legacy.agentId,
       name: legacy.name, backend: legacy.backend, port: legacy.port,
-      ...(legacy.cwd ? { cwd: legacy.cwd } : {}), peers: legacy.peers,
+      ...(legacy.cwd ? { cwd: legacy.cwd } : {}), peers: normalizePeers(legacy.peers),
+      ...(legacy.stateDirectory ? { stateDirectory: legacy.stateDirectory } : {}),
     }] };
   } catch {
     throw new ConfigurationError({ message: "Invalid server configuration" });
@@ -163,6 +187,37 @@ function isLoopback(url: URL): boolean {
   return url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
+function pathsOverlap(left: string, right: string): boolean {
+  const a = resolve(left); const b = resolve(right);
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+function normalizePeers(peers: ServerConfig["peers"]): ApplicationBindingConfig["peers"] {
+  return Object.fromEntries(Object.entries(peers).map(([name, peer]) => {
+    const value = typeof peer === "string" ? { url: peer } : peer;
+    return [name, value.auth ? { url: value.url, auth: value.auth } : { url: value.url }];
+  }));
+}
+export function validatePeerConfiguration(peers: ApplicationBindingConfig["peers"], env: NodeJS.ProcessEnv): void {
+  const policies = new Map<string, string>();
+  for (const [alias, peer] of Object.entries(peers)) {
+    const url = new URL(peer.url);
+    if (peer.auth) {
+      if (url.protocol !== "https:" && !isLoopback(url)) throw new Error("Bearer peer auth requires HTTPS");
+      const token = env[peer.auth.tokenEnv];
+      if (!token?.trim() || /[\r\n]/.test(token)) throw new Error(`Required environment variable ${peer.auth.tokenEnv} is missing or invalid`);
+    }
+    const signature = JSON.stringify(peer.auth ? [peer.auth.tokenEnv, peer.auth.owner] : null);
+    const canonicalEndpoint = url.href;
+    const prior = policies.get(canonicalEndpoint);
+    if (prior !== undefined && prior !== signature) throw new Error("Conflicting same-URL peer alias policies");
+    policies.set(canonicalEndpoint, signature);
+    if (!alias.trim()) throw new Error("Invalid peer alias");
+  }
+}
+export function validatePeerAliases(peers: ServerConfig["peers"], env: NodeJS.ProcessEnv): void {
+  const normalized = normalizePeers(peers);
+  validatePeerConfiguration(normalized, env);
+}
 
 export const loadConfig = Effect.fn("loadConfig")(function*(
   path: string,

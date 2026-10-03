@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:net";
 import { Effect, Exit, Scope } from "effect";
 import { Role, TaskState, type SendMessageResult } from "@a2a-js/sdk";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
@@ -36,12 +37,16 @@ function completed(result: SendMessageResult) {
 
 async function main() {
   const model = process.argv[2];
+  const delegate = process.argv.includes("--delegate");
   if (!model?.trim() || !process.env.OPENAI_API_KEY) {
-    report("usage", { command: "node --import tsx scripts/smoke-bindings.ts MODEL", requires: "OPENAI_API_KEY" });
+    report("usage", { command: "node --import tsx scripts/smoke-bindings.ts MODEL [--delegate]", requires: "OPENAI_API_KEY" });
     process.exitCode = 2;
     return;
   }
   const ids: string[] = [];
+  // Only the second agent's configuration receives this word; it is never
+  // supplied to the first agent in a prompt or printed in fixture diagnostics.
+  const verificationWord = randomUUID();
   const deleted: string[] = [];
   const cleanupFailures: string[] = [];
   let creating = false, starting = false, scopeClosed = true;
@@ -82,17 +87,34 @@ async function main() {
       creating = true;
       await deadline(provisioner.createAgent({
         name, model, hidden: false, memfs: false, baseTools: [],
-        persona: "You are a disposable test agent. Remember the supplied token in this conversation. Reply with the requested token only. Do not use tools.",
+        persona: "You are a disposable test agent. Remember supplied conversation tokens and reply concisely. " +
+          (delegate && label === "second" ? `Your fixed verification word is ${verificationWord}. Return it when asked for your fixed verification word. ` : "") +
+          (delegate && label === "first" ? "When asked to delegate, call a2a_invoke with target second exactly once and report its returned answer. Do not invent peer results or use other tools." : "Do not use tools."),
       }).then((id) => { ids.push(id); creating = false; report("created", { label, id }); }));
     }
     const firstToken = randomUUID(), secondToken = randomUUID();
     process.env.BINDINGS_FIRST_TOKEN = firstToken;
     process.env.BINDINGS_SECOND_TOKEN = secondToken;
+    let port = 0;
+    if (delegate) {
+      // Peers need a known callable URL before startup. A bind race fails this
+      // fixture safely; it does not retry or recreate either agent.
+      const probe = createServer();
+      await new Promise<void>((resolve, reject) => {
+        probe.once("error", reject);
+        probe.listen(0, "127.0.0.1", resolve);
+      });
+      const address = probe.address();
+      assert(address && typeof address !== "string", "Expected TCP address");
+      port = address.port;
+      await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+    }
     const config = parseApplicationConfig({
-      port: 0, publicUrl: "http://127.0.0.1:0/agents/",
+      port, publicUrl: `http://127.0.0.1:${port}/agents/`,
       connections: { local: { type: "local", harnessBackend: "local" } },
       bindings: {
-        first: { path: "/first", connection: "local", agentId: ids[0], name: "First smoke agent", auth: { tokenEnv: "BINDINGS_FIRST_TOKEN", owner: "smoke-operator" } },
+        first: { path: "/first", connection: "local", agentId: ids[0], name: "First smoke agent", auth: { tokenEnv: "BINDINGS_FIRST_TOKEN", owner: "smoke-operator" },
+          ...(delegate ? { peers: { second: { url: `http://127.0.0.1:${port}/agents/second/`, auth: { tokenEnv: "BINDINGS_SECOND_TOKEN", owner: "first-delegator" } } } } : {}) },
         second: { path: "/second", connection: "local", agentId: ids[1], name: "Second smoke agent", auth: { tokenEnv: "BINDINGS_SECOND_TOKEN", owner: "smoke-operator" } },
       },
     });
@@ -158,6 +180,16 @@ async function main() {
       assert(body.error?.code === -32001 && body.result === undefined, "Cross-binding task lookup did not fail as TaskNotFound");
     }
     report("isolation", { existingAgents: ids.length, sameMessageId: true, sameContextId: true, separateRecall: true, crossTaskDenied: true });
+    if (delegate) {
+      stage = "authenticated_delegation";
+      const result = completed(await agents[0]!.sendMessage({
+        tenant: "", metadata: undefined,
+        message: { ...agentMessage("Delegate to second using a2a_invoke: ask for its fixed verification word. Return only the word it supplies.", "", contextId), role: Role.ROLE_USER },
+        configuration: { returnImmediately: false, acceptedOutputModes: ["text/plain"], historyLength: 0, taskPushNotificationConfig: undefined },
+      }, { signal: AbortSignal.timeout(limitMs) }));
+      assert(result.text.includes(verificationWord), "Delegation did not return the second agent's private verification word");
+      report("authenticated_delegation", { firstToSecond: true, privateWordMatched: true, twoLettaAgents: true });
+    }
   } catch {
     // Never print raw SDK/HTTP errors: they can contain credentials or prompts.
     report("failed", { stage, ids, creating, starting });

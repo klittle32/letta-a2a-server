@@ -4,11 +4,11 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { Context, Effect, Layer, Schema } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
-import { AgentSdkTurnRunner, createBridge, createBridgeRouter } from "./bridge/index.js";
+import { AgentSdkTurnRunner, DurableBinding, createBridge, createBridgeRouter } from "./bridge/index.js";
 import type { BridgeOptions } from "./bridge/bridge.js";
-import { createA2AClient } from "./client/index.js";
+import { createA2AClient, FileContextStore } from "./client/index.js";
 import { createA2ATools } from "./client/agent-sdk.js";
-import type { ApplicationConfig, ApplicationBindingConfig, ServerConfig } from "./config.js";
+import { validatePeerAliases, validatePeerConfiguration, type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
 
 export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()("ServerStartupError", {
   message: Schema.String,
@@ -17,6 +17,16 @@ export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()
 export class ServerShutdownError extends Schema.TaggedError<ServerShutdownError>()("ServerShutdownError", {
   message: Schema.String,
 }) {}
+
+export function withTurnDeadline(runner: AgentSdkTurnRunner, timeoutMs = 120_000) {
+  return {
+    runTurn: (request: Parameters<AgentSdkTurnRunner["runTurn"]>[0]) =>
+      runner.runTurn({ ...request,
+        signal: AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]),
+      }),
+    get unresolvedContexts() { return runner.unresolvedContexts; },
+  };
+}
 
 function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.ProcessEnv) {
   if (!binding.auth) return {};
@@ -39,7 +49,7 @@ function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.
       },
       authorize: async ({ caller }: { caller: { subject: string } }) => caller.subject === owner,
     },
-    security: { securitySchemes: { bearer: { httpAuthSecurityScheme: { scheme: "bearer" } } } as never, securityRequirements: [{ schemes: { bearer: [] } }] },
+    security: { securitySchemes: { bearer: { scheme: { $case: "httpAuthSecurityScheme", value: { scheme: "Bearer", description: "Bearer token authentication", bearerFormat: "opaque" } } } }, securityRequirements: [{ schemes: { bearer: [] } }] },
     transport: {
       middleware: [unauthorized, gate],
       userBuilder: async () => ({ isAuthenticated: true, userName: owner }),
@@ -81,7 +91,7 @@ export const acquireSdkClient = Effect.fn("Server.acquireSdkClient")(
 
 /** Acquires server resources; the supplied SDK client remains caller-owned. */
 const acquireBinding = Effect.fn("Server.acquireBinding")(
-  function* (config: ServerConfig, client: LettaAgentClient, extra: ReturnType<typeof makeBearerBridgeOptions> = {}) {
+  function* (config: ServerConfig & { id?: string }, client: LettaAgentClient, extra: ReturnType<typeof makeBearerBridgeOptions> = {}, env: NodeJS.ProcessEnv = process.env) {
     // The SDK supplies no cancellation/drain contract here. Pending
     // interruption must await real retrieval (and lazy management startup)
     // before scope finalizers may close the owning client.
@@ -92,49 +102,78 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
     if (agent.id !== config.agentId) {
       return yield* new ServerStartupError({ message: "Configured agent identity could not be verified" });
     }
+    validatePeerAliases(config.peers, env);
+    const peers = Object.fromEntries(Object.entries(config.peers).map(([name, peer]) => [name, typeof peer === "string" ? { url: peer } : peer]));
+    const durability = config.stateDirectory
+      ? yield* Effect.acquireRelease(
+          Effect.tryPromise({
+            try: () => DurableBinding.open({ directory: config.stateDirectory!, bindingId: config.id ?? config.agentId }),
+            catch: () => new ServerStartupError({ message: "Durable state could not be opened" }),
+          }),
+          (resource) => shutdown("Durable state shutdown failed", () => resource.close()),
+        )
+      : undefined;
     const outbound = yield* Effect.acquireRelease(
       Effect.try({
-        try: () => Object.keys(config.peers).length ? createA2AClient({ routes: config.peers }) : undefined,
+        try: () => {
+          if (!Object.keys(config.peers).length) return undefined;
+          const routes = Object.fromEntries(Object.entries(peers).map(([alias, peer]) => [alias, peer.url]));
+          const policyCache = new Map<string, NonNullable<Parameters<typeof createA2AClient>[0]["routePolicies"]>[string]>();
+          const routePolicies = Object.fromEntries(Object.entries(peers).flatMap(([alias, peer]) => {
+            if (!peer.auth) return [];
+            const endpoint = new URL(peer.url).href;
+            const signature = JSON.stringify([endpoint, peer.auth.owner, peer.auth.tokenEnv]);
+            const existing = policyCache.get(signature);
+            if (existing) return [[alias, existing]];
+            const origin = new URL(peer.url).origin;
+            const policy = {
+              destinationOrigins: [origin], peerIdentity: `peer:${endpoint}`,
+              credential: {
+                owner: peer.auth.owner, audience: endpoint, origins: [origin], headerNames: ["authorization"],
+                provide: async () => ({ owner: peer.auth!.owner, audience: endpoint,
+                  headers: { authorization: `Bearer ${env[peer.auth!.tokenEnv]!}` } }),
+              },
+            };
+            policyCache.set(signature, policy);
+            return [[alias, policy]];
+          }));
+          return createA2AClient({ routes, routePolicies,
+            ...(config.stateDirectory ? { contextStore: new FileContextStore(`${config.stateDirectory}/outbound-context.json`) } : {}) });
+        },
         catch: () => new ServerStartupError({ message: "Outbound client construction failed" }),
       }),
       (resource) => shutdown("Outbound client shutdown failed", () => resource?.close()),
     );
+    const backendIdentity = JSON.stringify([
+      config.backend.type,
+      config.backend.type === "remote" ? config.backend.url :
+        config.backend.type === "local" ? config.backend.harnessBackend ?? "local" : config.backend.computer ?? null,
+      config.backend.type === "remote" ? config.backend.tokenEnv ?? null :
+        config.backend.type === "cloud" ? config.backend.apiKeyEnv ?? null : null,
+    ]);
+    durability?.bindAgent(config.agentId, backendIdentity);
     const runner = new AgentSdkTurnRunner(client, config.agentId, {
-      sharingDomain: config.agentId,
+      sharingDomain: config.id ?? config.agentId,
+      ...(durability ? { conversationMapping: durability.conversationMapping, execution: durability.execution } : {}),
       sessionOptions(scope) {
-        const tools = outbound ? createA2ATools({
-          client: outbound,
-          // Read the ready conversation dynamically, never snapshot it before
-          // the SDK binds the session to its actual conversation.
-          getScope: () => ({ agentId: scope.agentId, conversationId: scope.conversationId ?? null }),
-          signal: scope.signal,
+        const tools = outbound ? createA2ATools({ client: outbound,
+          getScope: () => ({ agentId: scope.agentId, conversationId: scope.conversationId ?? null }), signal: scope.signal,
         }) : undefined;
         const names = new Set(tools?.tools.map((tool) => tool.name));
-        return {
-          options: {
-            ...(config.cwd ? { cwd: config.cwd } : {}),
-            permissionMode: "standard",
-            ...(tools ? { tools: tools.tools } : {}),
-            // Retain normal SDK tools/skills and ordinary auto-approval rules.
-            canUseTool: async (name) => names.has(name)
-              ? { behavior: "allow" }
-              : { behavior: "deny", message: "This server has no interactive approval UI", interrupt: false },
-          },
-          close: () => tools?.close(),
-        };
+        return { options: { ...(config.cwd ? { cwd: config.cwd } : {}), permissionMode: "standard",
+          ...(tools ? { tools: tools.tools } : {}),
+          canUseTool: async (name) => names.has(name) ? { behavior: "allow" } :
+            { behavior: "deny", message: "This server has no interactive approval UI", interrupt: false },
+        }, close: () => tools?.close() };
       },
     });
     const bridge = yield* Effect.acquireRelease(
       Effect.try({
         try: () => createBridge({
-          runner: {
-            runTurn: (request) => runner.runTurn({
-              ...request,
-              signal: AbortSignal.any([request.signal, AbortSignal.timeout(120_000)]),
-            }),
-            get unresolvedContexts() { return runner.unresolvedContexts; },
-          },
-          sharingDomain: config.agentId,
+          runner: withTurnDeadline(runner),
+          sharingDomain: config.id ?? config.agentId,
+          ...(durability ? { durability } : {}),
+          ...(durability ? { backendIdentity, durabilityAgentId: config.agentId } : {}),
           publicBaseUrl: config.publicUrl,
           name: config.name,
           ...(extra as unknown as Pick<BridgeOptions, "auth" | "security" | "transport">),
@@ -202,13 +241,15 @@ export const startApplicationServer = Effect.fn("Server.startApplicationServer")
   function* (config: ApplicationConfig, createClient: (binding: ApplicationBindingConfig) => LettaAgentClient, host = "127.0.0.1", env: NodeJS.ProcessEnv = process.env) {
     const app = express(); app.disable("x-powered-by");
     app.get("/healthz", (_request, response) => response.json({ status: "ok" }));
+    for (const binding of config.bindings) validatePeerConfiguration(binding.peers, env);
     const bridges: Array<{ binding: ApplicationBindingConfig; bridge: ReturnType<typeof createBridge> }> = [];
     for (const binding of config.bindings) {
       const client = yield* acquireSdkClient(() => createClient(binding));
-      const serverConfig: ServerConfig = { agentId: binding.agentId, name: binding.name, backend: binding.backend, port: config.port,
-        publicUrl: binding.publicUrl, peers: binding.peers, ...(binding.cwd ? { cwd: binding.cwd } : {}) };
+      const serverConfig: ServerConfig & { id: string } = { id: binding.id, agentId: binding.agentId, name: binding.name, backend: binding.backend, port: config.port,
+        publicUrl: binding.publicUrl, peers: binding.peers,
+        ...(binding.stateDirectory ? { stateDirectory: binding.stateDirectory } : {}), ...(binding.cwd ? { cwd: binding.cwd } : {}) };
       const extra = makeBearerBridgeOptions(binding, env);
-      const bridge = (yield* acquireBinding(serverConfig, client, extra)).bridge;
+      const bridge = (yield* acquireBinding(serverConfig, client, extra, env)).bridge;
       bridges.push({ binding, bridge });
       const externalPrefix = new URL(config.publicUrl).pathname.replace(/\/$/, "");
       const mountPath = `${externalPrefix}${binding.path}` || "";

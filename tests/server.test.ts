@@ -6,7 +6,8 @@ import { Role } from "@a2a-js/sdk";
 import { parseApplicationConfig, parseConfig } from "../src/config.js";
 import { createA2AClient } from "../src/client/index.js";
 import { createOfficialClientProvider } from "../src/client/a2a-invoker.js";
-import { startApplicationServer, startServer, acquireSdkClient } from "../src/server.js";
+import { startApplicationServer, startServer, acquireSdkClient, withTurnDeadline } from "../src/server.js";
+import { AgentSdkTurnRunner } from "../src/bridge/letta-agent.js";
 
 for (const retrievalFails of [false, true]) {
   test(`retrieval interruption retains ownership until SDK promise settles; failure=${retrievalFails}`, async () => {
@@ -293,6 +294,31 @@ test("direct discovery and two turns use an existing agent and preserve conversa
   }
 }, 15000);
 
+test("execution deadline aborts both memory and durable-profile runners", async () => {
+  for (const profile of ["memory", "durable"] as const) {
+    let aborted = false;
+    let finish!: () => void;
+    const waiting = new Promise<void>((resolve) => { finish = resolve; });
+    const client = {
+      createSession: () => ({
+        async ready() { return { conversationId: "deadline-conversation" }; },
+        async send() {}, async abort() { aborted = true; finish(); },
+        async *stream() { await waiting; },
+        async [Symbol.asyncDispose]() {},
+      }),
+      resumeSession: () => { throw new Error("Unexpected resume"); },
+    } as unknown as LettaAgentClient;
+    const runner = new AgentSdkTurnRunner(client, "agent", { sharingDomain: profile, sessionOptions: {} });
+    const bounded = withTurnDeadline(runner, 25);
+    const request = {
+      a2aContextId: "context", messageId: "message", text: "wait", signal: new AbortController().signal,
+      onAssistantText() {},
+    };
+    await expect(bounded.runTurn(request)).rejects.toThrow();
+    expect(aborted).toBe(true);
+  }
+});
+
 test("one listener mounts independent bindings under a public prefix and protects bearer routes", async () => {
   const sessions: string[] = [];
   const clients: string[] = [];
@@ -403,6 +429,118 @@ test("partial multi-binding startup failure closes every acquired SDK client", a
   }
   expect(closed.sort()).toEqual(["first", "second"]);
 });
+
+test("production aliases on one authenticated endpoint reuse their policy provider", async () => {
+  const config = parseApplicationConfig({ agentId: "agent-test", backend: { type: "local" },
+    peers: {
+      first: { url: "http://127.0.0.1:49991/peer", auth: { tokenEnv: "PEER_TOKEN", owner: "peer-service" } },
+      second: { url: "http://127.0.0.1:49991/peer", auth: { tokenEnv: "PEER_TOKEN", owner: "peer-service" } },
+    },
+  });
+  const client = { agents: { retrieve: async (id: string) => ({ id }) }, createSession() {}, async close() {} } as unknown as LettaAgentClient;
+  const scope = await Effect.runPromise(Scope.make());
+  const server = await Effect.runPromise(startApplicationServer(config, () => client, "127.0.0.1", { PEER_TOKEN: "private" })
+    .pipe(Effect.provideService(Scope.Scope, scope)));
+  expect(server.bindings.default).toBeDefined();
+  await Effect.runPromise(Scope.close(scope, Exit.void));
+});
+
+test("production peer tools separate same-origin identities and share identical URL aliases", async () => {
+  const peerConfig = parseApplicationConfig({ publicUrl: "http://127.0.0.1:0/peer", port: 0,
+    connections: { local: { type: "local" } }, bindings: {
+      one: { path: "/one", connection: "local", agentId: "peer-one", auth: { tokenEnv: "ONE_IN", owner: "shared-peer-owner" } },
+      two: { path: "/two", connection: "local", agentId: "peer-two", auth: { tokenEnv: "TWO_IN", owner: "shared-peer-owner" } },
+    },
+  });
+  const peerScope = await Effect.runPromise(Scope.make());
+  const peerServer = await Effect.runPromise(startApplicationServer(peerConfig, () => peerClient(), "127.0.0.1", {
+    ONE_IN: "peer-one-bearer", TWO_IN: "peer-two-bearer",
+  }).pipe(Effect.provideService(Scope.Scope, peerScope)));
+  const oneUrl = peerServer.bindings.one!;
+  const twoUrl = peerServer.bindings.two!;
+  expect(new URL(oneUrl).origin).toBe(new URL(twoUrl).origin);
+  const peerRequests: Array<{ url: string; authorization: string | null }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((input: Request | URL | string, init?: RequestInit) => {
+    const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+    if (url.origin === new URL(oneUrl).origin) {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      peerRequests.push({ url: url.href, authorization: headers.get("authorization") });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  const outputs: string[] = [];
+  const toolErrors: boolean[] = [];
+  const outerClient = {
+    agents: { retrieve: async (id: string) => ({ id }) },
+    createSession: (_agentId: string, options: CreateSessionOptions) => ({
+      async ready() { return { conversationId: "outer-conversation" }; },
+      async send() {
+        const invoke = options.tools?.find((tool) => tool.name === "a2a_invoke");
+        if (!invoke) throw new Error("Outbound invoke tool was not installed");
+        for (const target of ["one", "two", "one-alias", "one"]) {
+          const result = await invoke.execute(`call-${target}-${outputs.length}`, { target, message: "peer call" });
+          const text = result.content[0]?.text;
+          if (typeof text !== "string") throw new Error("Peer tool returned no text");
+          toolErrors.push(result.isError === true);
+          outputs.push(text);
+        }
+      },
+      async abort() {},
+      async *stream() { yield { type: "result", success: true, result: "done", durationMs: 1, conversationId: "outer-conversation" }; },
+      async [Symbol.asyncDispose]() {},
+    }),
+    async close() {},
+  } as unknown as LettaAgentClient;
+  const outerConfig = parseApplicationConfig({ agentId: "outer-agent", backend: { type: "local" }, publicUrl: "http://127.0.0.1:0", port: 0,
+    peers: {
+      one: { url: oneUrl, auth: { tokenEnv: "ONE_OUT", owner: "shared-peer-owner" } },
+      two: { url: twoUrl, auth: { tokenEnv: "TWO_OUT", owner: "shared-peer-owner" } },
+      "one-alias": { url: oneUrl, auth: { tokenEnv: "ONE_OUT", owner: "shared-peer-owner" } },
+    },
+  });
+  const outerScope = await Effect.runPromise(Scope.make());
+  try {
+    const app = await Effect.runPromise(startApplicationServer(outerConfig, () => outerClient, "127.0.0.1", {
+      ONE_OUT: "peer-one-bearer", TWO_OUT: "peer-two-bearer",
+    }).pipe(Effect.provideService(Scope.Scope, outerScope)));
+    const remote = createA2AClient({ routes: { agent: app.bindings.default! }, pollIntervalMs: 5 });
+    try {
+      await remote.invoke({ target: "agent", message: "run peer tools", localScope: "caller", signal: AbortSignal.timeout(5000) });
+      expect(toolErrors).toEqual([false, false, false, false]);
+      const contextIds = outputs.map((text) => (JSON.parse(text) as { contextId?: string }).contextId);
+      expect(contextIds[0]).toBeTruthy();
+      expect(contextIds[1]).toBeTruthy();
+      expect(contextIds[0]).not.toBe(contextIds[1]);
+      expect(contextIds[2]).toBe(contextIds[0]);
+      expect(contextIds[3]).toBe(contextIds[0]);
+      const oneRequests = peerRequests.filter((request) => new URL(request.url).pathname.startsWith("/peer/one"));
+      const twoRequests = peerRequests.filter((request) => new URL(request.url).pathname.startsWith("/peer/two"));
+      expect(oneRequests.length).toBeGreaterThan(0);
+      expect(twoRequests.length).toBeGreaterThan(0);
+      expect(oneRequests.every((request) => request.authorization === "Bearer peer-one-bearer")).toBe(true);
+      expect(twoRequests.every((request) => request.authorization === "Bearer peer-two-bearer")).toBe(true);
+    } finally { remote.close(); }
+  } finally {
+    globalThis.fetch = originalFetch;
+    await Effect.runPromise(Scope.close(outerScope, Exit.void));
+    await Effect.runPromise(Scope.close(peerScope, Exit.void));
+  }
+}, 15000);
+
+function peerClient() {
+  const open = () => ({
+    async ready() { return { conversationId: "same-peer-conversation" }; },
+    async send() {}, async abort() {},
+    async *stream() { yield { type: "result", success: true, result: "peer answer", durationMs: 1, conversationId: "same-peer-conversation" }; },
+    async [Symbol.asyncDispose]() {},
+  });
+  return {
+    agents: { retrieve: async (id: string) => ({ id }) },
+    createSession: open, resumeSession: open, async close() {},
+  } as unknown as LettaAgentClient;
+}
 
 test("launcher ownership closes its client when startup fails", async () => {
   let closed = false;

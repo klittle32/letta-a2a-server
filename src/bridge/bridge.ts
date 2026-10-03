@@ -82,6 +82,10 @@ export interface BridgeOptions {
   taskStore?: TaskStore;
   /** Opened local single-owner recovery profile. Cannot be combined with another task store. */
   durability?: DurableBinding;
+  /** Stable configured connection identity saved beside the durable agent identity. */
+  backendIdentity?: string;
+  /** Existing agent identity for durable bindings composed around a supplied runner. */
+  durabilityAgentId?: string;
   shutdownTimeoutMs?: number;
 }
 export type CreateBridgeOptions = BridgeOptions &
@@ -121,8 +125,6 @@ export function createBridge(options: CreateBridgeOptions) {
     throw new Error("An explicit sharing domain is required");
   if (options.durability && options.taskStore)
     throw new Error("Durability owns its task store");
-  if (options.durability && options.client)
-    options.durability.bindAgent(options.agentId!);
   const runner =
     options.runner ??
     new AgentSdkTurnRunner(options.client!, options.agentId!, {
@@ -134,6 +136,11 @@ export function createBridge(options: CreateBridgeOptions) {
         execution: options.durability.execution,
       } : {}),
     });
+  if (options.durability)
+    options.durability.bindAgent(
+      options.durabilityAgentId ?? options.agentId ?? options.sharingDomain,
+      options.backendIdentity,
+    );
   const executor = new LettaAgentExecutor(
     runner,
     options.shutdownTimeoutMs,

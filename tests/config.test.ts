@@ -86,6 +86,27 @@ describe("server configuration", () => {
     }
   });
 
+  test("normalizes authenticated peer aliases and durable state directories", () => {
+    const config = parseApplicationConfig({ ...base, stateDirectory: "/var/lib/letta-a2a", peers: {
+      helper: { url: "https://peer.example/rpc", auth: { tokenEnv: "PEER_TOKEN", owner: "helper-service" } },
+    } });
+    expect(config.bindings[0]?.peers).toEqual({ helper: {
+      url: "https://peer.example/rpc", auth: { tokenEnv: "PEER_TOKEN", owner: "helper-service" },
+    } });
+    expect(config.bindings[0]?.stateDirectory).toBe("/var/lib/letta-a2a");
+  });
+  test("rejects unsafe binding IDs and state directory overlap", () => {
+    for (const id of [".", "..", "../escape"]) {
+      expect(() => parseApplicationConfig({ publicUrl: "http://127.0.0.1", stateDirectory: "/var/lib/server", connections: { local: { type: "local" } }, bindings: {
+        [id]: { path: "/agent", connection: "local", agentId: "agent" },
+      } })).toThrow(ConfigurationError);
+    }
+    expect(() => parseApplicationConfig({ publicUrl: "http://127.0.0.1", connections: { local: { type: "local" } }, bindings: {
+      a: { path: "/a", connection: "local", agentId: "a", stateDirectory: "/var/lib/shared" },
+      b: { path: "/b", connection: "local", agentId: "b", stateDirectory: "/var/lib/shared/child" },
+    } })).toThrow(ConfigurationError);
+  });
+
   test("rejects unknown keys recursively, invalid discriminants, ports, and unsafe URLs", () => {
     for (const input of [
       { ...base, extra: "secret-marker" },
@@ -187,6 +208,14 @@ describe("server configuration", () => {
       { ...base, backend: { type: "cloud", apiKey: "secret" } },
       { ...base, backend: { type: "local", computer: "elsewhere" } },
     ]) expect(() => parseConfig(input)).toThrow();
+  });
+  test("remote App Server accepts WebSocket URLs and rejects A2A-only schemes", () => {
+    for (const url of ["ws://127.0.0.1:4500", "wss://app.example/ws", "http://app.example", "https://app.example"]) {
+      expect(parseConfig({ ...base, backend: { type: "remote", url } }).backend).toEqual({ type: "remote", url });
+    }
+    for (const url of ["file:///tmp/x", "ws://user:pass@app.example"]) {
+      expect(() => parseConfig({ ...base, backend: { type: "remote", url } })).toThrow();
+    }
   });
 
   test("advertises IPv4 loopback only while allowing Docker port mapping", () => {

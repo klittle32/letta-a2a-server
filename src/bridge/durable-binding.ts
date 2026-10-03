@@ -275,11 +275,14 @@ export class DurableBinding {
       throw new Error("Bridge must drain before durable owner release");
     this.storage.close();
   }
-  bindAgent(agentId: string): void {
-    const old = this.storage.getRecord<string>("meta", "agentId");
-    if (!agentId || (old && old !== agentId))
-      throw new Error("Durable agent identity mismatch");
-    this.storage.setRecord("meta", "agentId", agentId);
+  bindAgent(agentId: string, backendIdentity = "unspecified"): void {
+    const identity = JSON.stringify([agentId, backendIdentity]);
+    const old = this.storage.getRecord<string>("meta", "agentIdentity");
+    const legacyAgentId = this.storage.getRecord<string>("meta", "agentId");
+    if (!agentId || !backendIdentity || (old && old !== identity) ||
+        (legacyAgentId && legacyAgentId !== agentId))
+      throw new Error("Durable agent or backend identity mismatch");
+    this.storage.setRecord("meta", "agentIdentity", identity);
   }
   private attempts(): RecoveryRecord[] {
     return this.storage.records<RecoveryRecord>("executions").map(([, r]) => r);
