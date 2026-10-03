@@ -1,12 +1,14 @@
 import express from "express";
+import { timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { Context, Effect, Layer, Schema } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AgentSdkTurnRunner, createBridge, createBridgeRouter } from "./bridge/index.js";
+import type { BridgeOptions } from "./bridge/bridge.js";
 import { createA2AClient } from "./client/index.js";
 import { createA2ATools } from "./client/agent-sdk.js";
-import type { ServerConfig } from "./config.js";
+import type { ApplicationConfig, ApplicationBindingConfig, ServerConfig } from "./config.js";
 
 export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()("ServerStartupError", {
   message: Schema.String,
@@ -15,6 +17,43 @@ export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()
 export class ServerShutdownError extends Schema.TaggedError<ServerShutdownError>()("ServerShutdownError", {
   message: Schema.String,
 }) {}
+
+function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.ProcessEnv) {
+  if (!binding.auth) return {};
+  const token = env[binding.auth.tokenEnv];
+  if (!token?.trim()) throw new ServerStartupError({ message: `Required environment variable ${binding.auth.tokenEnv} is missing` });
+  const owner = binding.auth.owner;
+  const unauthorized: import("express").RequestHandler = (_req, _res, next) => next();
+  const gate: import("express").RequestHandler = (req, res, next) => {
+    const values = req.headers.authorization;
+    if (Array.isArray(values) || (values && !/^Bearer [^\s,]+$/i.test(values))) { res.status(401).json({ error: "Authentication required" }); return; }
+    const supplied = values?.slice(7);
+    if (!supplied || !constantTimeEqual(supplied, token)) { res.status(401).json({ error: "Authentication required" }); return; }
+    next();
+  };
+  return {
+    auth: {
+      projectCaller: async (context: import("@a2a-js/sdk/server").ServerCallContext) => {
+        const user = context.user as (typeof context.user & { userName?: string });
+        return user?.isAuthenticated && user.userName === owner ? { issuer: "configured", subject: owner, tenant: binding.id } : undefined;
+      },
+      authorize: async ({ caller }: { caller: { subject: string } }) => caller.subject === owner,
+    },
+    security: { securitySchemes: { bearer: { httpAuthSecurityScheme: { scheme: "bearer" } } } as never, securityRequirements: [{ schemes: { bearer: [] } }] },
+    transport: {
+      middleware: [unauthorized, gate],
+      userBuilder: async () => ({ isAuthenticated: true, userName: owner }),
+    },
+  };
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left); const b = Buffer.from(right);
+  return a.length === b.length && requireTimingSafeEqual(a, b);
+}
+function requireTimingSafeEqual(a: Buffer, b: Buffer): boolean {
+  return timingSafeEqual(a, b);
+}
 
 // Imported promises do not establish backend cancellation. Finalizers await the
 // actual public disposal promises, uninterruptibly, and never retry sent work.
@@ -41,8 +80,8 @@ export const acquireSdkClient = Effect.fn("Server.acquireSdkClient")(
 );
 
 /** Acquires server resources; the supplied SDK client remains caller-owned. */
-export const startServer = Effect.fn("Server.start")(
-  function* (config: ServerConfig, client: LettaAgentClient, host = "127.0.0.1") {
+const acquireBinding = Effect.fn("Server.acquireBinding")(
+  function* (config: ServerConfig, client: LettaAgentClient, extra: ReturnType<typeof makeBearerBridgeOptions> = {}) {
     // The SDK supplies no cancellation/drain contract here. Pending
     // interruption must await real retrieval (and lazy management startup)
     // before scope finalizers may close the owning client.
@@ -98,6 +137,7 @@ export const startServer = Effect.fn("Server.start")(
           sharingDomain: config.agentId,
           publicBaseUrl: config.publicUrl,
           name: config.name,
+          ...(extra as unknown as Pick<BridgeOptions, "auth" | "security" | "transport">),
         }),
         catch: () => new ServerStartupError({ message: "Inbound bridge construction failed" }),
       }),
@@ -108,6 +148,13 @@ export const startServer = Effect.fn("Server.start")(
         });
       }),
     );
+    return { bridge };
+  },
+);
+
+export const startServer = Effect.fn("Server.start")(
+  function* (config: ServerConfig, client: LettaAgentClient, host = "127.0.0.1") {
+    const { bridge } = yield* acquireBinding(config, client);
     const app = express();
     app.disable("x-powered-by");
     app.get("/healthz", (_request, response) => response.json({ status: "ok" }));
@@ -138,7 +185,7 @@ export const startServer = Effect.fn("Server.start")(
       url.port = String(address.port);
       for (const entry of bridge.card.supportedInterfaces) entry.url = url.href;
     }
-    return { url: url.href.replace(/\/$/, "") };
+    return { url: url.href.replace(/\/$/, ""), bridge };
   },
 );
 
@@ -150,3 +197,48 @@ export class Server extends Context.Service<Server, { readonly url: string }>()(
     }));
   }
 }
+
+export const startApplicationServer = Effect.fn("Server.startApplicationServer")(
+  function* (config: ApplicationConfig, createClient: (binding: ApplicationBindingConfig) => LettaAgentClient, host = "127.0.0.1", env: NodeJS.ProcessEnv = process.env) {
+    const app = express(); app.disable("x-powered-by");
+    app.get("/healthz", (_request, response) => response.json({ status: "ok" }));
+    const bridges: Array<{ binding: ApplicationBindingConfig; bridge: ReturnType<typeof createBridge> }> = [];
+    for (const binding of config.bindings) {
+      const client = yield* acquireSdkClient(() => createClient(binding));
+      const serverConfig: ServerConfig = { agentId: binding.agentId, name: binding.name, backend: binding.backend, port: config.port,
+        publicUrl: binding.publicUrl, peers: binding.peers, ...(binding.cwd ? { cwd: binding.cwd } : {}) };
+      const extra = makeBearerBridgeOptions(binding, env);
+      const bridge = (yield* acquireBinding(serverConfig, client, extra)).bridge;
+      bridges.push({ binding, bridge });
+      const externalPrefix = new URL(config.publicUrl).pathname.replace(/\/$/, "");
+      const mountPath = `${externalPrefix}${binding.path}` || "";
+      const routed = createBridgeRouter(bridge);
+      app.use((req, res, next) => {
+        if (mountPath && !(req.path === mountPath || req.path.startsWith(`${mountPath}/`))) return next();
+        const originalUrl = req.url;
+        if (mountPath) {
+          const remainder = req.url.slice(mountPath.length);
+          req.url = remainder.startsWith("/") ? remainder : `/${remainder}`;
+        }
+        res.once("finish", () => { req.url = originalUrl; });
+        routed(req, res, (routeError) => { req.url = originalUrl; next(routeError); });
+      });
+    }
+    const listener = yield* Effect.acquireRelease(Effect.try({
+      try: () => app.listen(config.port, host), catch: () => new ServerStartupError({ message: "HTTP listener acquisition failed" }),
+    }), (resource) => shutdown("HTTP listener shutdown failed", () => new Promise<void>((resolve, reject) => {
+      resource.close((error) => error ? reject(error) : resolve()); resource.closeAllConnections();
+    })));
+    yield* Effect.tryPromise({ try: () => once(listener, "listening"), catch: () => new ServerStartupError({ message: "HTTP listener startup failed" }) }).pipe(Effect.uninterruptible);
+    const address = listener.address() as AddressInfo;
+    const prefix = new URL(config.publicUrl);
+    if (prefix.port === "0") prefix.port = String(address.port);
+    const bindings = Object.fromEntries(bridges.map(({ binding, bridge }) => {
+      const endpoint = new URL(binding.publicUrl);
+      if (endpoint.port === "0") endpoint.port = String(address.port);
+      for (const supported of bridge.card.supportedInterfaces) supported.url = endpoint.href;
+      return [binding.id, endpoint.href.replace(/\/$/, "")];
+    }));
+    return { url: `${prefix.origin}${prefix.pathname.replace(/\/$/, "")}`, bindings };
+  },
+);

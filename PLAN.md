@@ -101,6 +101,26 @@ Current registry observations, not verified compatibility: SDK `0.8.28`, Code `0
 
 **Goal:** one process/port serves multiple independent configured agents.
 
+**Implementation checkpoint (October 3, 2026 UTC):** implemented in the Phase 3
+worktree. Legacy and multi-binding CLI paths, optional inbound
+bearer authentication, mounted card discovery, startup validation, and separate
+binding resources are covered by 61 tests / 290 assertions, compiler/build gates,
+and independent review. A live local-backend test passed with two disposable
+agents, reused A2A message/context IDs, separate recall, cross-task denial, and
+verified exact-ID cleanup. See the README for the runnable example and evidence
+limits. After separate approval, the local development service on `41242` was
+activated with `/agents/first/` and `/agents/second/`; both passed host Go CLI
+streaming checks. The first local identity was retained and one additional
+persistent local test agent was created. The Cloud-backed service on `41241`
+was not restarted or changed. At activation, source was still uncommitted in the
+worktree.
+
+The trial image was built from this worktree before Git delivery, not the then-older
+primary checkout. Rebuild only from a checkout containing Phase 3. The shared
+`letta-a2a-server:dev` image tag now points to Phase 3; an all-service Compose
+update can therefore also recreate the still-older Cloud-backed container.
+Use service-specific operations when that service must remain untouched.
+
 - Extend the same configuration with named backend connections and agent bindings. Reuse connection settings without introducing client pooling unless the SDK requires it; independent binding clients are the simple starting point.
 - Each binding owns its route, existing agent ID, card identity, peer access, and task/conversation namespace. Keep outbound context stores binding-specific too: coincident agent/conversation IDs on different backends must not share peer context. No caller-supplied agent IDs or dynamic provisioning.
 - Support mounted endpoints such as `/scooter` and `/researcher`, including a configured external path prefix. Compute discovery and callable URLs from explicit public configuration, not unchecked request headers or assumed gateway rewriting.

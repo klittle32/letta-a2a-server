@@ -566,7 +566,9 @@ export function createOfficialClientProvider(
           },
         },
       });
-      const client = await operation.run(() => factory.createFromUrl(url));
+      const discoveryBase = new URL(url);
+      if (!discoveryBase.pathname.endsWith("/")) discoveryBase.pathname += "/";
+      const client = await operation.run(() => factory.createFromUrl(discoveryBase.href));
       const getCard = client.getAgentCard.bind(client);
       client.getAgentCard = async (...args) => {
         const card = await getCard(...args);

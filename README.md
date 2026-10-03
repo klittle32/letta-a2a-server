@@ -4,13 +4,15 @@ A small server exposing existing Letta agents through A2A. Built from the reusab
 bridge and client in [letta-a2a](https://github.com/klittle32/letta-a2a), without
 agentgateway, LiteLLM, or the laboratory deployment stack.
 
-**Work in progress.** This first slice is a single-agent, loopback development
-server. Public authenticated hosting and multiple bindings are not implemented
-yet. See [PLAN.md](PLAN.md). No production-readiness or Cloud parity claim.
+**Work in progress.** The server supports one existing agent or several fixed,
+named agent bindings on one listener. Optional per-binding bearer authentication
+protects discovery and invocation. See [PLAN.md](PLAN.md). No production-readiness
+or complete runtime-parity claim.
 
 The application uses **Effect v4**: Effect Schema validates configuration,
-`Server.layer` constructs scoped resources, and the Node Effect runtime handles
-signals and finalization. The official A2A SDK still owns protocol handling;
+the launcher acquires resources in an Effect scope, and the Node Effect runtime
+handles signals and finalization. `Server.layer` also retains the single-agent
+integration seam. The official A2A SDK still owns protocol handling;
 the Letta SDK owns agent execution. Their Promise-based adapters retain the
 existing task ownership and uncertain-cancellation safeguards.
 
@@ -30,8 +32,8 @@ docker compose ps
 
 The ordinary compiled server runs in both containers. It reconnects to explicit
 agent IDs; startup never creates, reconfigures, or deletes agents. There is no
-temporary launcher or automatic provisioning loop. The two-service setup does
-not yet implement several bindings inside one server process.
+temporary launcher or automatic provisioning loop. This default pair remains two
+separate processes; either process can instead serve multiple configured bindings.
 
 Send messages from the host using the Go `a2a` CLI:
 
@@ -65,8 +67,8 @@ docker compose up -d --build        # Rebuild after source/dependency changes
 ```
 
 Do not use `down -v` unless you intend to erase local agent state. Both published
-ports are host-loopback only; the container network is trusted. There is no public
-hosting authentication in this slice.
+ports are host-loopback only; the container network is trusted. Bearer-protected
+bindings do not add TLS termination or make the deployment a multi-tenant service.
 
 ### One-time configuration for a fresh checkout
 
@@ -115,6 +117,55 @@ For host-native execution, use an agent available to that host's backend and
 make `publicUrl` match its actual listening port; the Compose local example
 advertises Docker's host-side port mapping instead.
 
+### Several agents on one listener
+
+`config.bindings.example.json` shows two local-backend agents sharing one listener
+under `/agents/first/` and `/agents/second/`. Copy it to an ignored local file and
+replace both agent IDs with agents already present in the selected runtime:
+
+```sh
+cp config.bindings.example.json config.bindings.local.json
+# Set both existing agent IDs before starting.
+A2A_LOCAL_CONFIG_FILE=./config.bindings.local.json docker compose up -d --build local
+```
+
+That example uses the local service's published port `41242`. It does not change
+the separate Cloud-backed service. Put `A2A_LOCAL_CONFIG_FILE` in the ignored
+project `.env` if this selection should persist for later Compose commands.
+
+```sh
+a2a --endpoint http://127.0.0.1:41242/agents/first/ --transport jsonrpc --timeout 120s send --stream "Hello"
+a2a --endpoint http://127.0.0.1:41242/agents/second/ --transport jsonrpc --timeout 120s send --stream "Hello"
+```
+
+Each endpoint's Agent Card is at its own `/.well-known/agent-card.json` suffix.
+`connections` names reusable backend **settings**, not shared application clients.
+Each binding owns its SDK client, task/conversation state, outbound peer context,
+and session tools. Reusing a message or context ID on another binding does not
+select that binding's conversation; task lookup/cancellation cannot cross routes.
+Two bindings to the same Letta agent still share that agent's memory.
+
+`publicUrl` supplies the explicit advertised base and path prefix; `path` adds
+the binding's route. The server mounts the complete path. A reverse proxy must
+preserve that prefix, not silently strip it. Host and forwarding headers do not
+choose advertised URLs. Anonymous bindings stay loopback-only; externally
+advertised bearer-protected endpoints require HTTPS with TLS supplied outside
+this Node listener.
+
+For optional inbound authentication, add this to a binding:
+
+```json
+"auth": { "tokenEnv": "A2A_FIRST_TOKEN", "owner": "operator" }
+```
+
+Pass the named variable explicitly into the server container and use
+`--auth "Bearer $A2A_FIRST_TOKEN"` on the client. The default Compose services only
+inject their documented backend key; adding a key to `.env` alone does **not**
+inject an arbitrary authentication variable. `owner` is a stable identity across
+token rotation, not the token itself. The same token is one trust domain, not
+per-person authorization. Inbound tokens are not forwarded to Letta or peers.
+Protected cards and RPC/SSE calls both require the token.
+
 ### Opt-in live smoke test
 
 This is separate from `npm test`: it creates a disposable agent and makes paid
@@ -142,6 +193,18 @@ progress precedes a single complete answer artifact, followed by matching
 and cleanup outcomes, not credentials or reasoning traces. Cancellation is not proved by these successful
 turns. Cloud sandbox termination on close is SDK best-effort, not independent
 evidence that the sandbox stopped.
+
+The separate two-binding check uses one temporary local backend and two disposable
+agents. It requires an explicit model and makes four model calls:
+
+```sh
+docker compose run --rm local node --import tsx scripts/smoke-bindings.ts openai/gpt-5.4-mini
+```
+
+It checks protected discovery under a mounted prefix, independent conversation
+recall when both routes receive the same message/context IDs, and denied
+cross-binding task lookup. It verifies exact-ID deletion after the server scope
+closes. It does not activate the multi-binding configuration in the running services.
 
 ## Effect development tools
 
@@ -182,7 +245,8 @@ not old v3 or pre-release examples.
 
 ## Runtime configuration
 
-`backend` selects the SDK connection, not the A2A transport:
+`backend` selects the SDK connection, not the A2A transport. In the multi-binding
+form, put these same settings in a named `connections` entry:
 
 ```json
 { "type": "local" }
@@ -214,8 +278,9 @@ unauthenticated development endpoint.
 ```
 
 Cloud stores agent state in Letta Cloud. `computer` selects execution; omitting it
-uses the SDK's managed-sandbox path. A top-level optional `cwd` refers to that
-runtime's filesystem, not automatically the Docker filesystem. The managed-sandbox
+uses the SDK's managed-sandbox path. Optional `cwd` belongs to each binding
+(top-level in the single-agent form) and refers to that runtime's filesystem, not
+automatically the Docker filesystem. The managed-sandbox
 path has live smoke coverage below; connected-computer execution remains unverified.
 
 Keep secrets in the ignored `.env`; Compose explicitly maps the required key per
@@ -224,7 +289,9 @@ mapping. Never mount the whole host Letta home to borrow authentication.
 
 ## A2A behavior
 
-- Agent Card: `/.well-known/agent-card.json`; JSON-RPC at `/`; health at `/healthz`.
+- Each binding's Agent Card is at its `/.well-known/agent-card.json` suffix and
+  JSON-RPC at its endpoint. Single-agent defaults remain the root paths.
+  Health stays at `/healthz`, outside binding routes, and returns only `status: ok`.
 - Text-only A2A 1.0 with streaming, task lookup, and context continuation.
 - Streaming reports safe observed activity through standard working-status
   messages, then publishes one complete answer artifact on success. Progress
@@ -266,13 +333,16 @@ metadata, inherited from the initial installed-tree lock generation. A lock-only
 refresh in an empty Docker directory preserved every version but did not fill
 those fields. `npm ci` passes; registry-integrity metadata repair remains pending.
 
-Checkpoint (October 2, 2026): Node 24.19.0, Bun 1.4.2, installed SDK 0.8.28,
+Checkpoint (October 2–3, 2026): Node 24.19.0, Bun 1.4.2, installed SDK 0.8.28,
 SDK-bundled Code 0.34.2, A2A SDK 1.1.0, and the pinned Effect/TypeScript toolchain
 above. Clean Docker `npm ci` patches the compiler successfully; the current suite
-passes 51 tests (252 assertions), Effect-enabled typecheck, and build. Compiled
+passes 61 tests (290 assertions), Effect-enabled typecheck, and build. Compiled
 Node imports also passed at the foundation checkpoint.
 Compiled Node HTTP discovery and two-turn continuity also pass using fake SDK
 sessions, with disposal awaited at scope exit.
+Phase 3 additionally passes the compiled two-binding example and provider-free
+entrypoint, mounted discovery, authentication, configuration, and partial-startup
+cleanup checks. Independent review found no remaining blocking issue.
 Temporary negative probes proved that floating Effects, invalid optional fields,
 and unchecked indexed access fail compilation. Tests include real Node signal
 handling: clean interruption exits 130; failed SDK cleanup or incomplete bridge
@@ -303,6 +373,23 @@ Cloud tests requested a five-minute sandbox TTL and best-effort termination on
 session close; independent sandbox termination was not checked. Hosted runtime
 version was not pinned. Remote App Server, Cloud connected-computer execution,
 and live cancellation remain unverified. Successful turns do not prove cancellation.
+
+The Phase 3 local-backend live fixture also passed with two disposable agents on
+one listener: bearer-protected discovery under `/agents/`, independent recall
+despite reused A2A message/context IDs, cross-binding task denial, scope shutdown,
+and verified deletion of both exact IDs. Its first run passed the interaction
+checks but failed cleanup verification: a local SDK management connection opened
+before agent creation retained the old agent-list view. A provider-free repro
+confirmed that a fresh connection sees the created agent and can verify deletion;
+the fixture now closes its preflight connection before creation. This is a fixture
+lifecycle adjustment, not a server-side retry or an SDK cancellation guarantee.
+Authenticated peer invocation and broader runtime combinations remain unverified.
+
+The two-route configuration was subsequently activated on local development port
+`41242` with the original local agent and one additional persistent test agent.
+Both endpoints passed Go `a2a` 0.3.0 `send --stream` checks: activity, one complete
+answer, then completion. This trial uses anonymous host-loopback access. The
+Cloud-backed container on `41241` was left running unchanged.
 
 The subsequent normal Compose configuration was verified separately with two
 dedicated persistent agents. Host Go `a2a` v0.3.0 completed real messages and

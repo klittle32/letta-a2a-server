@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Message, Task, TaskState } from "@a2a-js/sdk";
 import { createA2ATools } from "../src/client/agent-sdk.js";
-import { A2AInvocationError } from "../src/client/a2a-invoker.js";
+import { A2AInvocationError, createOfficialClientProvider } from "../src/client/a2a-invoker.js";
 import { projectA2AResult, runA2ATool, type A2AToolClient } from "../src/client/tool-operations.js";
 const scope = () => ({ agentId: "agent-1", conversationId: "conversation-1" });
 const task = Task.fromJSON({
@@ -27,6 +27,23 @@ function fixture() {
   return { client, scopes };
 }
 const args = { target: "remote", message: "hello" };
+
+test("official provider discovers a mounted endpoint relative to its final path segment", async () => {
+  const requested: string[] = [];
+  const mockFetch = Object.assign(async (input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    requested.push(url);
+    return Response.json({
+      name: "Mounted", description: "mounted", version: "1",
+      supportedInterfaces: [{ url: "http://127.0.0.1:41241/agents/first/", protocolBinding: "JSONRPC", protocolVersion: "1.0" }],
+      capabilities: { streaming: true }, defaultInputModes: ["text/plain"], defaultOutputModes: ["text/plain"], skills: [],
+    });
+  }, fetch);
+  const provider = createOfficialClientProvider({ fetchImpl: mockFetch });
+  const client = await provider("http://127.0.0.1:41241/agents/first");
+  expect(requested).toEqual(["http://127.0.0.1:41241/agents/first/.well-known/agent-card.json"]);
+  expect(await client.getAgentCard()).toBeDefined();
+});
 
 
 describe("session-owned SDK A2A tools", () => {

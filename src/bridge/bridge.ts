@@ -113,7 +113,7 @@ export function createBridge(options: CreateBridgeOptions) {
       url.password ||
       url.search ||
       url.hash ||
-      url.pathname !== "/"
+      !safePath(url.pathname)
     )
       throw new Error("Authenticated bridge requires an HTTP(S) origin");
   }
@@ -673,10 +673,13 @@ function assertLoopbackUrl(value: string): void {
     url.password ||
     url.search ||
     url.hash ||
-    url.pathname !== "/"
+    !safePath(url.pathname)
   ) {
     throw new Error("Anonymous bridge requires a loopback HTTP origin");
   }
+}
+function safePath(path: string): boolean {
+  return !/%2f|%5c|%2e/i.test(path) && !path.split("/").some((part) => part === "." || part === "..");
 }
 function createAgentCard(
   baseUrl: string,

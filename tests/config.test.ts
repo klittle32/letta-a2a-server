@@ -1,10 +1,69 @@
 import { describe, expect, test } from "bun:test";
 import { Effect, FileSystem, Schema } from "effect";
-import { ConfigurationError, loadConfig, parseConfig, sdkOptions, serverConfigSchema } from "../src/config.js";
+import { ConfigurationError, loadApplicationConfig, loadConfig, parseApplicationConfig, parseConfig, sdkOptions, serverConfigSchema } from "../src/config.js";
 
 const base = { agentId: "agent-example", backend: { type: "local" } };
 
 describe("server configuration", () => {
+  test("normalizes fixed multi-agent bindings with prefixed mounted URLs and per-binding auth", () => {
+    const config = parseApplicationConfig({
+      port: 0,
+      publicUrl: "https://agents.example/gateway/",
+      connections: { local: { type: "local", harnessBackend: "local" } },
+      bindings: {
+        a: { path: "/a", connection: "local", agentId: "existing-a", name: "A", auth: { tokenEnv: "A2A_A_TOKEN", owner: "operator" } },
+        b: { path: "/b", connection: "local", agentId: "existing-b", name: "B", auth: { tokenEnv: "A2A_B_TOKEN", owner: "operator-b" } },
+      },
+    });
+    expect(config.bindings.map((binding) => [binding.id, binding.path, binding.publicUrl, binding.agentId])).toEqual([
+      ["a", "/a", "https://agents.example/gateway/a/", "existing-a"],
+      ["b", "/b", "https://agents.example/gateway/b/", "existing-b"],
+    ]);
+    expect(config.bindings[0]?.auth).toEqual({ tokenEnv: "A2A_A_TOKEN", owner: "operator" });
+    expect(config.port).toBe(0);
+  });
+
+  test("legacy application config normalizes to one root binding and loads through FileSystem", async () => {
+    const normalized = parseApplicationConfig({ ...base, port: 0, publicUrl: "http://127.0.0.1:0" });
+    expect(normalized.bindings).toHaveLength(1);
+    expect(normalized.bindings[0]?.path).toBe("");
+    const fs = FileSystem.makeNoop({ readFileString: () => Effect.succeed(JSON.stringify(base)) });
+    expect((await Effect.runPromise(loadApplicationConfig("config.json").pipe(Effect.provideService(FileSystem.FileSystem, fs)))).bindings)
+      .toHaveLength(1);
+  });
+
+  test("rejects root bindings when another mounted binding is configured", () => {
+    expect(() => parseApplicationConfig({
+      publicUrl: "http://127.0.0.1:41241/",
+      connections: { local: { type: "local" } },
+      bindings: {
+        root: { path: "", connection: "local", agentId: "root-agent" },
+        child: { path: "/child", connection: "local", agentId: "child-agent" },
+      },
+    })).toThrow(ConfigurationError);
+  });
+
+  test("rejects unknown connections, empty bindings, unsafe or colliding routes, and public anonymous bindings", () => {
+    const multi = {
+      connections: { local: { type: "local" } },
+      bindings: { a: { path: "/a", connection: "local", agentId: "a" } },
+    };
+    for (const input of [
+      { ...multi, bindings: {} },
+      { ...multi, bindings: { a: { path: "/a", connection: "missing", agentId: "a" } } },
+      ...["constructor", "__proto__", "toString"].map((connection) => ({
+        connections: {}, bindings: { test: { path: "/test", connection, agentId: "never-started" } },
+      })),
+      { ...multi, bindings: { a: { path: "/healthz", connection: "local", agentId: "a" } } },
+      { ...multi, bindings: {
+        root: { path: "", connection: "local", agentId: "root-agent" },
+        child: { path: "/child", connection: "local", agentId: "child-agent" },
+      } },
+      { ...multi, bindings: { a: { path: "/a%2fb", connection: "local", agentId: "a" } } },
+      { ...multi, bindings: { a: { path: "/a", connection: "local", agentId: "a" }, b: { path: "/A/", connection: "local", agentId: "b" } } },
+      { ...multi, publicUrl: "https://agents.example/base", bindings: multi.bindings },
+    ]) expect(() => parseApplicationConfig(input)).toThrow(ConfigurationError);
+  });
   test("preserves defaults, trimming, optional fields, and exact URL output", () => {
     const config = parseConfig({ ...base, agentId: " agent-example ", name: " Agent ",
       port: 0, publicUrl: "http://127.0.0.1:80", cwd: "/work",

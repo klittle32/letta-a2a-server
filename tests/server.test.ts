@@ -2,9 +2,11 @@ import { expect, test } from "bun:test";
 import { Effect, Exit, Scope } from "effect";
 import type { CreateSessionOptions, LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AGENT_CARD_PATH } from "@a2a-js/sdk";
-import { parseConfig } from "../src/config.js";
+import { Role } from "@a2a-js/sdk";
+import { parseApplicationConfig, parseConfig } from "../src/config.js";
 import { createA2AClient } from "../src/client/index.js";
-import { startServer, acquireSdkClient } from "../src/server.js";
+import { createOfficialClientProvider } from "../src/client/a2a-invoker.js";
+import { startApplicationServer, startServer, acquireSdkClient } from "../src/server.js";
 
 for (const retrievalFails of [false, true]) {
   test(`retrieval interruption retains ownership until SDK promise settles; failure=${retrievalFails}`, async () => {
@@ -290,6 +292,117 @@ test("direct discovery and two turns use an existing agent and preserve conversa
     expect(clientCloses).toBe(0); // Injected clients remain caller-owned.
   }
 }, 15000);
+
+test("one listener mounts independent bindings under a public prefix and protects bearer routes", async () => {
+  const sessions: string[] = [];
+  const clients: string[] = [];
+  const makeClient = (key: string) => ({
+    agents: { retrieve: async (id: string) => ({ id }) },
+    createSession: () => {
+      sessions.push(key);
+      return {
+        async ready() { return { conversationId: "same-id" }; }, async send() {}, async abort() {},
+        async *stream() { yield { type: "result", success: true, result: key, durationMs: 1, conversationId: "same-id" }; },
+        async [Symbol.asyncDispose]() {},
+      };
+    },
+    async close() { clients.push(key); },
+  }) as unknown as LettaAgentClient;
+  const config = parseApplicationConfig({ port: 0, publicUrl: "http://127.0.0.1:0/agents/",
+    connections: { local: { type: "local" } },
+    bindings: {
+      a: { path: "/a", connection: "local", agentId: "agent-a", auth: { tokenEnv: "A_TOKEN", owner: "operator-a" } },
+      b: { path: "/b", connection: "local", agentId: "agent-b", auth: { tokenEnv: "B_TOKEN", owner: "operator-b" } },
+    },
+  });
+  const scope = await Effect.runPromise(Scope.make());
+  const application = await Effect.runPromise(startApplicationServer(config, (binding) => makeClient(binding.id), "127.0.0.1", { A_TOKEN: "secret-a", B_TOKEN: "secret-b" })
+    .pipe(Effect.provideService(Scope.Scope, scope)));
+  try {
+    expect(Object.keys(application.bindings).sort()).toEqual(["a", "b"]);
+    for (const [key, url] of Object.entries(application.bindings)) {
+      const card = await fetch(`${url}/${AGENT_CARD_PATH}`, { headers: { authorization: `Bearer secret-${key}` } });
+      expect(card.ok).toBe(true);
+      const body = await card.json() as { supportedInterfaces: { url: string }[] };
+      expect(body.supportedInterfaces[0]?.url).toBe(`${url}/`);
+    }
+    const denied = await fetch(`${application.bindings.a}/${AGENT_CARD_PATH}`);
+    expect(denied.status).toBe(401);
+    const bad = await fetch(`${application.bindings.a}/`, { method: "POST", headers: { authorization: "Basic x" } });
+    expect(bad.status).toBe(401);
+    const peerA = await createOfficialClientProvider({ fetchImpl: ((input, init) => fetch(input, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), authorization: "Bearer secret-a" } })) as typeof fetch })(application.bindings.a!);
+    const peerB = await createOfficialClientProvider({ fetchImpl: ((input, init) => fetch(input, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), authorization: "Bearer secret-b" } })) as typeof fetch })(application.bindings.b!);
+    await peerA.sendMessage({ tenant: "", metadata: undefined, message: { messageId: "same-message", role: Role.ROLE_USER, parts: [{ content: { $case: "text", value: "a" }, mediaType: "text/plain", metadata: undefined, filename: "" }], contextId: "same-context", taskId: "", extensions: [], metadata: undefined, referenceTaskIds: [] }, configuration: { acceptedOutputModes: ["text/plain"], taskPushNotificationConfig: undefined, returnImmediately: false } });
+    await peerB.sendMessage({ tenant: "", metadata: undefined, message: { messageId: "same-message", role: Role.ROLE_USER, parts: [{ content: { $case: "text", value: "b" }, mediaType: "text/plain", metadata: undefined, filename: "" }], contextId: "same-context", taskId: "", extensions: [], metadata: undefined, referenceTaskIds: [] }, configuration: { acceptedOutputModes: ["text/plain"], taskPushNotificationConfig: undefined, returnImmediately: false } });
+    expect(sessions).toEqual(["a", "b"]);
+  } finally {
+    const close = Effect.runPromise(Scope.close(scope, Exit.void));
+    await close;
+  }
+  expect(clients.sort()).toEqual(["a", "b"]);
+}, 15000);
+
+test("legacy normalized root binding preserves health, card discovery, and invocation", async () => {
+  const opened: string[] = [];
+  const client = {
+    agents: { retrieve: async (id: string) => ({ id }) },
+    createSession: () => {
+      opened.push("turn");
+      return ({
+      async ready() { return { conversationId: "root-conversation" }; }, async send() {}, async abort() {},
+      async *stream() { yield { type: "result", success: true, result: "root answer", durationMs: 1, conversationId: "root-conversation" }; },
+      async [Symbol.asyncDispose]() {},
+      });
+    },
+    async close() {},
+  } as unknown as LettaAgentClient;
+  const config = parseApplicationConfig({ agentId: "legacy-root", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
+  const scope = await Effect.runPromise(Scope.make());
+  const server = await Effect.runPromise(startApplicationServer(config, () => client).pipe(Effect.provideService(Scope.Scope, scope)));
+  try {
+    expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
+    const card = await fetch(`${server.url}/${AGENT_CARD_PATH}`);
+    expect(card.status).toBe(200);
+    const body = await card.json() as { name: string };
+    expect(body.name).toBe("Letta A2A Agent");
+    const remote = createA2AClient({ routes: { root: server.bindings.default! }, pollIntervalMs: 10 });
+    try {
+      const result = await remote.invoke({ target: "root", message: "hello", localScope: "test", signal: AbortSignal.timeout(5000) });
+      expect(result).toBeDefined();
+      expect(opened).toEqual(["turn"]);
+    } finally { remote.close(); }
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+}, 10000);
+
+test("partial multi-binding startup failure closes every acquired SDK client", async () => {
+  const config = parseApplicationConfig({
+    port: 0, publicUrl: "http://127.0.0.1:0/agents/",
+    connections: { local: { type: "local" } },
+    bindings: {
+      first: { path: "/first", connection: "local", agentId: "first-agent" },
+      second: { path: "/second", connection: "local", agentId: "second-agent" },
+    },
+  });
+  const closed: string[] = [];
+  const createClient = (binding: { id: string }) => ({
+    agents: { retrieve: async (id: string) => {
+      if (id === "second-agent") throw new Error("expected test failure");
+      return { id };
+    } },
+    async close() { closed.push(binding.id); },
+  }) as unknown as LettaAgentClient;
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const exit = await Effect.runPromiseExit(startApplicationServer(config, createClient)
+      .pipe(Effect.provideService(Scope.Scope, scope)));
+    expect(Exit.isFailure(exit)).toBe(true);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+  expect(closed.sort()).toEqual(["first", "second"]);
+});
 
 test("launcher ownership closes its client when startup fails", async () => {
   let closed = false;

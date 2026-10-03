@@ -1,0 +1,23 @@
+{
+  "port": 41241,
+  "publicUrl": "http://127.0.0.1:41242/agents/",
+  "connections": {
+    "local": { "type": "local", "harnessBackend": "local" }
+  },
+  "bindings": {
+    "first": {
+      "path": "/first",
+      "connection": "local",
+      "agentId": "agent-local-replace-with-an-existing-first-agent",
+      "name": "First agent",
+      "peers": {}
+    },
+    "second": {
+      "path": "/second",
+      "connection": "local",
+      "agentId": "agent-local-replace-with-an-existing-second-agent",
+      "name": "Second agent",
+      "peers": {}
+    }
+  }
+}
