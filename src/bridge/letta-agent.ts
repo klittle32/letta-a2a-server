@@ -73,7 +73,7 @@ export interface SessionExecutionLifecycle {
     message: SDKMessage,
   ): void | Promise<void>;
   /** Normal success and all owned cleanup settled; not terminal task persistence. */
-  stopped?(request: LettaTurnRequest): void | Promise<void>;
+  stopped?(request: LettaTurnRequest, eligibleAnswer?: string, canceled?: boolean): void | Promise<void>;
   /** Called after local quarantine is installed; failure leaves it installed. */
   unresolved?(request: LettaTurnRequest): void | Promise<void>;
 }
@@ -163,6 +163,7 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
     let assistantText = "";
     let assistantKey: string | undefined;
     let sawAssistant = false;
+    let selectedAnswer = "";
     let lastActivity: string | undefined;
     const activity = (label: string) => {
       if (request.signal.aborted || label === lastActivity) return;
@@ -251,7 +252,19 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
         result.stopReason === "requires_approval"
       )
         throw new Error("The Letta turn requires reconciliation");
-      await this.policy.execution?.stopped?.(request);
+      // This is the single answer-selection boundary for live publication and
+      // durable recovery: final assistant text, or result-only transport fallback.
+      selectedAnswer = sawAssistant ? assistantText : (result.result ?? "");
+      const canceledDuringCleanup = request.signal.aborted;
+      await this.policy.execution?.stopped?.(
+        request,
+        canceledDuringCleanup ? undefined : selectedAnswer,
+        canceledDuringCleanup,
+      );
+      // Cancellation can arrive while durable stop confirmation is being
+      // written. Replace any just-committed answer with the canceled outcome.
+      if (!canceledDuringCleanup && request.signal.aborted)
+        await this.policy.execution?.stopped?.(request, undefined, true);
     } catch (error) {
       // Includes ambiguous sends, stream/observation errors, and cleanup failures.
       if (sent) {
@@ -261,9 +274,7 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
       throw error;
     }
     if (request.signal.aborted) throw new LettaTurnCancelledError();
-    // Remote SDK result.result contains ALL assistant messages, not just the
-    // final one. Use it only for transports that emitted no assistant slices.
-    return { text: sawAssistant ? assistantText : (result.result ?? "") };
+    return { text: selectedAnswer };
   }
 
   private async withContextLock<T>(

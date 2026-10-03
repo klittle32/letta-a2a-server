@@ -52,6 +52,9 @@ export interface RecoveryRecord {
   publicChunks: string[];
   runIds: string[];
   resultText?: string | undefined;
+  /** Selected final answer, committed only after successful execution and cleanup. */
+  eligibleAnswer?: string;
+  settledCanceled?: true;
   publication?: true;
   evidence?: string;
 }
@@ -202,10 +205,20 @@ export class DurableBinding {
         this.assertSize(Task.toJSON(preview), 3);
         this.put(r);
       },
-      stopped: async (request) => {
+      stopped: async (request, eligibleAnswer, canceled) => {
         this.updateTurn(request, (r) => {
           r.phase = "stopped";
           r.stopped = true;
+          if (canceled) {
+            delete r.eligibleAnswer;
+            r.settledCanceled = true;
+          } else if (eligibleAnswer !== undefined) {
+            r.eligibleAnswer = eligibleAnswer;
+            // The selected answer supersedes provisional deltas and the raw
+            // SDK aggregate; keep one copy in the journal until publication.
+            r.publicChunks = [];
+            delete r.resultText;
+          }
         });
       },
       unresolved: async (request) => {
@@ -334,6 +347,8 @@ export class DurableBinding {
         r.contextKey !== JSON.stringify([r.owner, r.tenant, r.contextId]) ||
         !Array.isArray(r.publicChunks) ||
         !r.publicChunks.every((v) => typeof v === "string") ||
+        (r.eligibleAnswer !== undefined && typeof r.eligibleAnswer !== "string") ||
+        (r.settledCanceled !== undefined && r.settledCanceled !== true) ||
         !Array.isArray(r.runIds) ||
         !r.runIds.every((v) => typeof v === "string") ||
         !Number.isFinite(r.createdAt) ||
@@ -651,6 +666,7 @@ export class DurableBinding {
     record.publication = true;
     record.publicChunks = [];
     delete record.resultText;
+    delete record.eligibleAnswer;
   }
   private recoveryEvents(
     record: RecoveryRecord,
@@ -658,14 +674,18 @@ export class DurableBinding {
     detail: string,
     text?: string,
   ): AgentExecutionEvent[] {
-    const chunks =
-      text !== undefined
-        ? [text]
-        : record.publicChunks.length
-          ? record.publicChunks
-          : record.resultText
-            ? [record.resultText]
-            : [];
+    // Legacy publicChunks/resultText are provisional observation records and
+    // must never be promoted during recovery. Only a post-cleanup selection is
+    // eligible; operator-supplied text remains separately explicit.
+    const selected =
+      text ??
+      (state === TaskState.TASK_STATE_COMPLETED &&
+      record.stopped &&
+      !record.settledCanceled &&
+      !record.cancelRequested
+        ? record.eligibleAnswer
+        : undefined);
+    const chunks = selected === undefined ? [] : [selected];
     const events: AgentExecutionEvent[] = [];
     if (chunks.length)
       events.push(
@@ -717,16 +737,21 @@ export class DurableBinding {
       const unsent =
         record.phase === "accepted" || record.phase === "preparing";
       const stopped = record.phase === "stopped" && record.stopped === true;
+      const canceled = stopped && (record.settledCanceled || record.cancelRequested);
       record.stopped = unsent || stopped;
       const snapshot = await this.reduce(
         record,
         this.recoveryEvents(
           record,
           stopped
-            ? TaskState.TASK_STATE_COMPLETED
+            ? canceled
+              ? TaskState.TASK_STATE_CANCELED
+              : TaskState.TASK_STATE_COMPLETED
             : TaskState.TASK_STATE_FAILED,
           stopped
-            ? "Recovered a stopped successful turn"
+            ? canceled
+              ? "Recovered a canceled settled turn"
+              : "Recovered a stopped successful turn"
             : unsent
               ? "Controller stopped before input submission; no input was sent"
               : "Execution status is unknown; operator reconciliation is required",

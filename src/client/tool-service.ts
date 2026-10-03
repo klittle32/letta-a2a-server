@@ -286,14 +286,9 @@ export class A2AToolService {
       submissionUnknown: true,
     };
     details.messageId = message.messageId;
-    // Journal before submission, including first sends with no remote readback ID.
-    await this.save(key, record);
-    if (contextId)
-      await this.save(
-        executionKey(this.storageEndpoint(url), contextId),
-        record,
-      );
     let accepted: Task | undefined;
+    // Entering a custom invoker is conservatively treated as possibly sent.
+    let invocationEntered = false;
     let releaseContext: (() => void) | undefined;
     let contextLease: Promise<void> | undefined;
     let lockedContext = contextId;
@@ -361,7 +356,18 @@ export class A2AToolService {
     };
 
     try {
+      // Journal before submission, including first sends with no remote readback
+      // ID. Partial write failures also belong to the unsent restoration path.
+      await this.save(key, record);
+      if (contextId)
+        await this.save(
+          executionKey(this.storageEndpoint(url), contextId),
+          record,
+        );
+      // Journal writes are asynchronous. Recheck after they settle so aborts
+      // during persistence never cross the custom-invoker boundary.
       signal.throwIfAborted();
+      invocationEntered = true;
       details.submissionAttempted = true;
       const result = await this.invoker.invoke({
         url,
@@ -432,9 +438,17 @@ export class A2AToolService {
           ? new A2AInvocationCancelledError(failure)
           : new A2AInvocationError(error.message, failure);
       }
+      if (!invocationEntered && !accepted) {
+        await this.save(key, binding);
+        if (contextId)
+          await this.save(
+            executionKey(this.storageEndpoint(url), contextId),
+            previous,
+          );
+      }
       throw new A2AInvocationError(
         error instanceof Error ? error.message : "A2A invocation failed",
-        { ...details, cause: error },
+        { ...details, submissionAttempted: invocationEntered, cause: error },
       );
     } finally {
       callbacksOpen = false;

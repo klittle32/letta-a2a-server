@@ -2,7 +2,7 @@
 
 ## Toolchain and checks
 
-The October 3 cleanup passes **88 tests / 414 assertions**, Effect compiler checks, build, the provider-free HTTP fixture, and compiled Node SQLite reopen/identity-guard checks. Regression checks fail against the original startup/factory code and when the durable-profile deadline is removed. No live model calls, dependency upgrades, image rebuilds, or persistent-service changes were made for this cleanup.
+The October 3 follow-up for [recovery issue #1](https://github.com/klittle32/letta-a2a-server/issues/1) and [pre-send cancellation issue #2](https://github.com/klittle32/letta-a2a-server/issues/2) passes **107 tests / 499 assertions**, Effect compiler checks, build, and the provider-free HTTP fixture. The regressions reproduce against the original code. Compiled Node checks also cover answer filtering and late cancellation across SQLite reopen, plus file-backed unsent rollback and subsequent admission. These use deterministic interruption checkpoints and fake SDK/peer execution, not live-backend crash or cancellation proofs. No live model calls, dependency upgrades, image rebuilds, or persistent-service changes were made.
 
 The recorded baseline used Node `24.19.0`, npm `11.17.0`, Bun `1.4.2` (test runner only), Letta Agent SDK `0.8.28`, bundled Code `0.34.2`, A2A SDK `1.1.0`, Effect and `@effect/platform-node` `4.0.0`, TypeScript `7.0.2`, and `@effect/tsgo` `0.48.0`. Live trials selected `openai/gpt-5.4-mini` explicitly. These are recorded versions, not a promise that every allowed SDK version was tested.
 

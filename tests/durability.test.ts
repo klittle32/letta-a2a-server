@@ -12,6 +12,7 @@ import { startApplicationServer } from "../src/server.js";
 import { TaskState } from "@a2a-js/sdk";
 import { Message, Task } from "@a2a-js/sdk";
 import { RequestContext, ServerCallContext } from "@a2a-js/sdk/server";
+import { AgentSdkTurnRunner } from "../src/bridge/letta-agent.js";
 
 test("state directories are assigned per binding and identity cannot cross backend or agent", async () => {
   const root = await mkdtemp(join(tmpdir(), "a2a-durable-"));
@@ -144,6 +145,289 @@ test("restart marks sent interrupted work uncertain and refuses context replay",
     const reopened = await DurableBinding.open({ directory: root, bindingId: "uncertain-binding" });
     expect(reopened.inspectRecovery()).toHaveLength(1);
     expect(() => reopened.assertAvailable(contextKey)).toThrow("reconciliation");
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart never publishes provisional text from an unresolved turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-provisional-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "provisional-binding" });
+    binding.bindAgent("provisional-agent", "local");
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "provisional-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "provisional-task", "provisional-context", context);
+    const contextKey = executionContextKey(request);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "provisional-artifact");
+    await binding.dispatched(request);
+    const turn = { taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
+      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+    await binding.execution.beforeSend!(turn, { agentId: "provisional-agent", conversationId: "provisional-conversation", otid: message.messageId });
+    await binding.execution.observe!(turn, { type: "assistant", content: "PRIVATE provisional answer", uuid: "delta" });
+    await binding.execution.observe!(turn, { type: "result", success: false, result: "PRIVATE full result", durationMs: 1, conversationId: "provisional-conversation", stopReason: "interrupted" });
+    await binding.execution.unresolved!(turn);
+    await binding.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "provisional-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    expect(recovered?.artifacts ?? []).toHaveLength(0);
+    expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runner cancellation during owned cleanup recovers without an answer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-cleanup-cancel-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "cleanup-cancel-binding" });
+    binding.bindAgent("cleanup-cancel-agent", "local");
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "cleanup-cancel-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "cleanup-cancel-task", "cleanup-cancel-context", context);
+    const contextKey = executionContextKey(request);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "cleanup-cancel-artifact");
+    await binding.dispatched(request);
+    let releaseCleanup!: () => void;
+    let cleanupEntered!: () => void;
+    const cleanupStarted = new Promise<void>((resolve) => { cleanupEntered = resolve; });
+    const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    const session = {
+      async ready() { return { conversationId: "cleanup-cancel-conversation" }; },
+      async send() {}, async abort() {},
+      async *stream() {
+        yield { type: "assistant", content: "PRIVATE provisional", uuid: "answer" };
+        yield { type: "result", success: true, result: "PRIVATE provisional", durationMs: 1, conversationId: "cleanup-cancel-conversation", stopReason: "end_turn" };
+      },
+      async [Symbol.asyncDispose]() {},
+    };
+    const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
+      "cleanup-cancel-agent", { sharingDomain: "test", execution: binding.execution,
+        sessionOptions: () => ({ options: {}, async close() { cleanupEntered(); await cleanupGate; } }) });
+    const controller = new AbortController();
+    const running = runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
+      text: "hello", signal: controller.signal, onAssistantText() {} });
+    await cleanupStarted;
+    controller.abort();
+    releaseCleanup();
+    await expect(running).rejects.toThrow("cancelled");
+    await binding.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "cleanup-cancel-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+    expect(recovered?.artifacts ?? []).toHaveLength(0);
+    expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runner and SQLite recovery share the filtered final answer boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-final-answer-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "final-answer-binding" });
+    binding.bindAgent("final-answer-agent", "local");
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "final-answer-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "final-answer-task", "final-answer-context", context);
+    const contextKey = executionContextKey(request);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "final-answer-artifact");
+    await binding.dispatched(request);
+    let cleaned = false;
+    const session = {
+      async ready() { return { conversationId: "final-answer-conversation" }; },
+      async send() {}, async abort() {},
+      async *stream() {
+        yield { type: "assistant", content: "PRIVATE pre-tool commentary", uuid: "commentary" };
+        yield { type: "tool_call", toolCallId: "tool", toolName: "lookup", toolInput: {}, uuid: "tool" };
+        yield { type: "assistant", content: "Final ", uuid: "final" };
+        yield { type: "assistant", content: "answer", uuid: "final" };
+        yield { type: "result", success: true, result: "PRIVATE pre-tool commentaryFinal answer", durationMs: 1, conversationId: "final-answer-conversation", stopReason: "end_turn" };
+      },
+      async [Symbol.asyncDispose]() {},
+    };
+    const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
+      "final-answer-agent", { sharingDomain: "test", execution: binding.execution,
+        sessionOptions: () => ({ options: {}, close() { cleaned = true; } }) });
+    await runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
+      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} });
+    expect(cleaned).toBe(true);
+    await binding.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "final-answer-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(JSON.stringify(recovered)).toContain("Final answer");
+    expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("result-only runner success recovers the actual final result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-result-only-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "result-only-binding" });
+    binding.bindAgent("result-only-agent", "local");
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "result-only-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "result-only-task", "result-only-context", context);
+    const contextKey = executionContextKey(request);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "result-only-artifact");
+    await binding.dispatched(request);
+    const session = {
+      async ready() { return { conversationId: "result-only-conversation" }; },
+      async send() {}, async abort() {},
+      async *stream() { yield { type: "result", success: true, result: "Actual final result", durationMs: 1, conversationId: "result-only-conversation", stopReason: "end_turn" }; },
+      async [Symbol.asyncDispose]() {},
+    };
+    const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
+      "result-only-agent", { sharingDomain: "test", execution: binding.execution, sessionOptions: () => ({ options: {} }) });
+    await runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
+      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} });
+    await binding.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "result-only-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(JSON.stringify(recovered)).toContain("Actual final result");
+    expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test.each(["result", "cleanup"] as const)("runner %s failure stays answer-free after SQLite reopen", async (failure) => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-cleanup-failure-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "cleanup-failure-binding" });
+    binding.bindAgent("cleanup-failure-agent", "local");
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "cleanup-failure-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "cleanup-failure-task", "cleanup-failure-context", context);
+    const contextKey = executionContextKey(request);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "cleanup-failure-artifact");
+    await binding.dispatched(request);
+    const session = {
+      async ready() { return { conversationId: "cleanup-failure-conversation" }; },
+      async send() {}, async abort() {},
+      async *stream() {
+        yield { type: "assistant", content: "PRIVATE provisional", uuid: "answer" };
+        yield { type: "result", success: failure !== "result", result: "PRIVATE result", durationMs: 1, conversationId: "cleanup-failure-conversation", stopReason: "end_turn" };
+      },
+      async [Symbol.asyncDispose]() {},
+    };
+    const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
+      "cleanup-failure-agent", { sharingDomain: "test", execution: binding.execution,
+        sessionOptions: () => ({ options: {}, close() { if (failure === "cleanup") throw new Error("cleanup failed"); } }) });
+    await expect(runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
+      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} })).rejects.toThrow(failure === "cleanup" ? "cleanup failed" : "requires reconciliation");
+    await binding.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "cleanup-failure-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    expect(recovered?.artifacts ?? []).toHaveLength(0);
+    expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancellation after stop prevents completed answer recovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-stopped-cancel-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "stopped-cancel-binding" });
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "stopped-cancel-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "stopped-cancel-task", "stopped-cancel-context", context);
+    const contextKey = executionContextKey(request);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "stopped-cancel-artifact");
+    await binding.dispatched(request);
+    const turn = { taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
+      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+    await binding.execution.beforeSend!(turn, { agentId: "agent", conversationId: "conversation", otid: message.messageId });
+    await binding.execution.stopped!(turn, "PRIVATE eligible answer");
+    await binding.requestCancellation(request.taskId, context);
+    await binding.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "stopped-cancel-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+    expect(recovered?.artifacts ?? []).toHaveLength(0);
+    expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy stopped observations stay private while saved publication survives recovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-legacy-publication-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "legacy-publication-binding" });
+    binding.bindAgent("legacy-publication-agent", "local");
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "legacy-publication-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "legacy-publication-task", "legacy-publication-context", context);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "legacy-publication-artifact");
+    await binding.close();
+    const store = await SqliteBindingStore.open({ directory: root, bindingId: "legacy-publication-binding" });
+    const [key, record] = store.records<Record<string, unknown>>("executions")[0]!;
+    Object.assign(record, { phase: "publishing", stopped: true, publicChunks: ["PRIVATE legacy delta"], resultText: "PRIVATE legacy result", publication: true });
+    store.setRecord("executions", key, record);
+    store.setRecord("publications", key, Task.toJSON(Task.fromJSON({ id: request.taskId, contextId: request.contextId,
+      status: { state: TaskState.TASK_STATE_COMPLETED }, artifacts: [{ artifactId: "saved-answer", parts: [{ text: "Legitimately published answer" }] }], history: [message] })));
+    store.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "legacy-publication-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(JSON.stringify(recovered)).toContain("Legitimately published answer");
+    expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
+    await reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy stopped observations without a saved publication stay private", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-legacy-stopped-"));
+  try {
+    const binding = await DurableBinding.open({ directory: root, bindingId: "legacy-stopped-binding" });
+    binding.bindAgent("legacy-stopped-agent", "local");
+    const context = new ServerCallContext();
+    const message = Message.fromJSON({ messageId: "legacy-stopped-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "legacy-stopped-task", "legacy-stopped-context", context);
+    const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
+    await binding.accept(request, initial, "legacy-stopped-artifact");
+    await binding.close();
+
+    const store = await SqliteBindingStore.open({ directory: root, bindingId: "legacy-stopped-binding" });
+    const [key, record] = store.records<Record<string, unknown>>("executions")[0]!;
+    Object.assign(record, { phase: "stopped", stopped: true, publicChunks: ["PRIVATE old delta"], resultText: "PRIVATE old result" });
+    store.setRecord("executions", key, record);
+    store.close();
+
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "legacy-stopped-binding" });
+    const recovered = await reopened.taskStore.load(request.taskId, context);
+    expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(recovered?.artifacts ?? []).toHaveLength(0);
+    expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
     await reopened.close();
   } finally {
     await rm(root, { recursive: true, force: true });

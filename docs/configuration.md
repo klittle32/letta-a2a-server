@@ -93,6 +93,10 @@ Directories must not overlap, and one process must own each binding directory. T
 
 Durability is local, single-owner recovery, not distributed failover or exactly-once tool execution. Restart does not replay sent work. Unresolved execution is retained for investigation and is not declared canceled. Identity guards compare configured agent/backend selectors and credential reference names; they do not independently verify the actual backend account, principal, or machine. Never repoint state at an unrelated backend.
 
+Automatic recovery publishes an answer only when the filtered final text was recorded after successful execution and owned cleanup. Provisional assistant observations and unfiltered result text are not recovery answers, including observations left by older versions. Already-published valid results remain recoverable.
+
+An outbound call canceled before submission restores its previous context records once pending journal writes settle. Its caller may receive cancellation before that restoration finishes; the operation retains its locks until persistence settles. This does not relax quarantine for an attempted or ambiguous send, and `new_context` is not a way to discard uncertain work.
+
 ## Security and operational boundaries
 
 - Server startup connects to explicit agent IDs; it does not create, reconfigure, or delete agents.
