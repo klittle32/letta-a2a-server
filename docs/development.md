@@ -116,6 +116,6 @@ Before preparing an npm release:
 - Decide the package contents and a single clear install/start interface. The current manifest has no `bin` entry or explicit published-file allowlist.
 - Verify a packed artifact installed in a clean directory, without checkout dependencies; exercise single-agent and named-binding setup from that installation.
 - Rerun the test, compiler, build, and provider-free checks; review dependency advisories and lockfile integrity.
-- Retain the MIT license and third-party notices in the distribution, and document the actually verified installation commands.
+- Retain the project's MIT license and any required dependency licenses and attribution notices in distributed packages or images, and document the actually verified installation commands.
 
 Passing repository checks is not installed-package verification. Publishing or deploying a release is a separate, explicit action.

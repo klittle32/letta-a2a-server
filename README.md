@@ -63,4 +63,4 @@ Source is built into the image; restart alone does not pick up code changes. `do
 
 Compose publishes ports on host loopback. Bearer authentication does not add TLS, process isolation, or multi-tenant security. Bindings to the same Letta agent share its memory. A2A task/context mappings reset on restart unless durable state is configured. Interrupted work is not automatically replayed, and interruption does not prove the backend stopped.
 
-Effect 4 owns configuration and resource lifecycle; the official A2A and Letta SDKs handle protocol and execution. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md) for licensing and attribution.
+Effect 4 owns configuration and resource lifecycle; the official A2A and Letta SDKs handle protocol and execution. This project is [MIT licensed](LICENSE); dependencies retain their own licenses.
