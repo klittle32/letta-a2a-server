@@ -46,6 +46,12 @@ The turn runner borrows its SDK client and owns each SDK session through asynchr
 
 The subsequent simplification was verified on October 4, 2026 in the cached Linux arm64 development image, with current source/tests/scripts mounted read-only and networking disabled: 89 tests / 432 assertions, `npm run check -- --noUnusedLocals --noUnusedParameters`, build, and provider-free smoke all passed. The smoke completed three fake SDK turns with zero agent creations or model calls. Regression coverage includes disposal-before-publication, the durable pre-session guard, and distinct owner-scoped conversations for identical wire context IDs. Independent review left no outstanding findings. This is source-level verification, not a new live-backend or installed-package proof; persistent services and the shared image were unchanged.
 
+## Request diagnostics
+
+The application's bridge error hook uses the configured Effect logger, minimum log level, and inherited annotations. Request failures log at `Error`; known turn-cancellation exceptions log at `Info`. Each diagnostic includes `bindingId`, `taskId` (`unassigned` when unavailable), and a fixed `errorType` classification. These are diagnostic events, not independent proof that a backend stopped.
+
+This hook does not forward arbitrary error names, messages, stacks, causes, request bodies, or tool payloads to the logger. It classifies known error types without reading their contents; other thrown values become `unknown`. Logger failures cannot change task outcomes or prevent resource cleanup. Upstream SDK logging is separate and unchanged. No telemetry service or additional logger dependency is required.
+
 ## Opt-in live fixtures
 
 Unlike the provider-free `--check` above, these commands create disposable agents and make paid model calls. Choose the backend and model explicitly; provide credentials through the environment, not source/config values.

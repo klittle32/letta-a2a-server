@@ -4,7 +4,7 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { Effect, Schema } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
-import { AgentSdkTurnRunner, DurableBinding, createBridge, createBridgeRouter } from "./bridge/index.js";
+import { AgentSdkTurnRunner, DurableBinding, LettaTurnCancelledError, createBridge, createBridgeRouter } from "./bridge/index.js";
 import { type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
 
 export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()("ServerStartupError", {
@@ -66,6 +66,15 @@ function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.
 function constantTimeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left); const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// Classify by known types, never by arbitrary error names, messages or causes.
+function requestErrorType(error: unknown): string {
+  if (error instanceof LettaTurnCancelledError) return "LettaTurnCancelledError";
+  if (error instanceof TypeError) return "TypeError";
+  if (error instanceof RangeError) return "RangeError";
+  if (error instanceof SyntaxError) return "SyntaxError";
+  return error instanceof Error ? "Error" : "unknown";
 }
 
 // Imported promises do not establish backend cancellation. Finalizers await the
@@ -150,6 +159,9 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
           ({ behavior: "deny", message: "This server has no interactive approval UI", interrupt: false }),
       },
     });
+    // SDK callbacks run outside the startup fiber. Retain its logger, level and
+    // annotations without creating background fibers or another runtime owner.
+    const runDiagnostic = Effect.runSyncWith(yield* Effect.context());
     const bridge = yield* Effect.acquireRelease(
       Effect.try({
         try: () => createBridge({
@@ -160,6 +172,17 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
           publicBaseUrl: config.publicUrl,
           name: config.name,
           ...extra,
+          onError: ({ taskId, error }) => {
+            const errorType = requestErrorType(error);
+            const log = errorType === "LettaTurnCancelledError"
+              ? Effect.logInfo("A2A cancellation reported")
+              : Effect.logError("A2A request failed");
+            runDiagnostic(log.pipe(Effect.annotateLogs({
+              bindingId: config.id ?? "default",
+              taskId: taskId || "unassigned",
+              errorType,
+            })));
+          },
         }),
         catch: () => new ServerStartupError({ message: "Inbound bridge construction failed" }),
       }),
