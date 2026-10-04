@@ -1,172 +1,58 @@
-# Letta A2A Server — extraction plan
+# Letta A2A Server — scope and acceptance plan
 
-Status: Phases 1–4 are implemented; Phase 5 packaging and installed-artifact verification remain pending. This document records the extraction scope and sequence. Use the [README](README.md) for current setup and [Development and support](docs/development.md) for verification limits. Service activation, package publication, and deployment remain separate decisions.
-
-Source: [letta-a2a issue #2](https://github.com/klittle32/letta-a2a/issues/2), reviewed against lab commit `2972081` on October 2, 2026.
+[Issue #3](https://github.com/klittle32/letta-a2a-server/issues/3) supersedes the earlier bidirectional extraction scope. This project is a focused server that exposes configured, existing Letta agents over A2A. Use the [README](README.md) for setup and [development reference](docs/development.md) for verification limits.
 
 ## Product boundary
 
-One installable, configurable Node.js service that exposes existing Letta agents as A2A agents. Each configured agent can receive A2A requests and call configured A2A peers through SDK session tools.
-
 ```text
-A2A caller → Letta A2A Server → Letta Agent SDK → selected Letta runtime
-                   │
-                   └─ session-owned A2A client tools → A2A peer
+A2A caller → Letta A2A Server → Letta Agent SDK → configured Letta runtime
 ```
 
-The outbound tools execute in the server's SDK process, even when the Letta runtime is remote or Cloud-backed. They are available to sessions this server hosts; this does not install tools into every other conversation with that agent.
+The server owns inbound transport, authentication, task/context lifecycle, and the adapter to Letta execution. It does not create agents on startup or install or replace their tools. Calling other A2A agents belongs in the agent's independently configured tools.
 
-**Direct A2A communication is the baseline.** Neither agentgateway nor LiteLLM is a dependency, required service, configuration concept, or acceptance prerequisite. Kyle will test them separately. A gateway may sit in front of ordinary endpoints without the server knowing its implementation.
+There is no production outbound A2A client, peer configuration, peer credential handling, outbound context store, or server-injected A2A tool. None is retained behind a flag, moved into another package, or reproduced as a demonstration subsystem. Official SDK clients in tests drive this server's inbound interfaces only.
 
-Keep one public server distribution. Preserve the reusable bridge/client separation internally; do not require separate library publication or introduce a plugin framework.
+Letta backend traffic and protected A2A push-notification delivery remain legitimate network activity. Server-only does not mean network-free.
 
-### Effect v4 implementation decision
+## Retained contract
 
-Kyle approved Effect v4 and its official development-tooling guidance on October 2.
-Use Effect-native configuration, typed errors, services/layers, and scoped resource
-ownership for the application. Keep the official A2A and Letta SDKs as adapters;
-do not replace their protocols or rewrite proven recovery logic just for style.
-Fiber interruption remains distinct from confirmed remote cancellation.
+- Bind explicit existing agent IDs; fail cleanly on retrieval or identity errors. Never provision or reconfigure an agent implicitly.
+- Support local state/execution, Cloud state with local execution, direct remote App Servers, and Cloud execution in a managed sandbox or on a compatible connected computer. `cwd` belongs to the execution target. Implementation support is distinct from live verification.
+- Keep single-agent configuration and fixed named bindings. Preserve public URLs, mounted paths, Agent Cards, text-only A2A 1.0 JSON-RPC/SSE, and truthful capability advertising.
+- Preserve task/context continuation, readback, status streaming, cancellation, execution deadlines, and orderly shutdown.
+- Publish only a settled final answer. Never expose provisional commentary through live output or restart recovery.
+- Keep owner/binding isolation, separate durable directories, inbound bearer authentication, backend credentials, and loopback/HTTPS guards.
+- Preserve noninteractive approval denial and the agent/runtime's normal configured tools. No server-supplied tool allowlist may become an allow-all policy.
+- Preserve uncertain-execution quarantine and recovery without automatic replay. A cancellation request is not proof that the backend stopped.
 
-Use Effect 4.0.0 and matching Node platform package, TypeScript 7.0.2, and
-`@effect/tsgo` 0.48.0. The project-local prepare hook patches TypeScript; the
-`@effect/language-service` tsconfig plugin supplies editor and build diagnostics.
-Use one compiler diagnostics path rather than duplicate Oxlint/LSP reporting.
-Enable strict checking, exact optional properties, checked indexed access, and
-verbatim module syntax. Keep supported SDK/Code ranges separate from these pinned
-tooling versions. Verify a floating Effect is actually rejected by the compiler.
+## Configuration transition
 
-References: [v4 devtools](https://effect.website/docs/v4/getting-started/devtools),
-[installation](https://effect.website/docs/v4/getting-started/installation), and
-[Schema compiler settings](https://effect.website/docs/v4/schema/introduction).
+Reject obsolete `peers` keys, including empty objects, with a sanitized instruction to remove them. Do not silently ignore obsolete security settings or print their values. Outbound credential references are no longer consumed.
 
-## Lean Docker development
+Do not open, write, or delete existing `outbound-context.json` files. Do not reset inbound durable databases. Users remove obsolete configuration before activating the new server; existing state is left alone.
 
-Use Docker for local development, not as a required production dependency. Keep one Dockerfile and one Compose file alongside source, example configuration, a short README, and focused tests. No gateway or OAuth demo stack.
+## Implementation and verification
 
-- Kyle's October 2 startup correction makes `docker compose up -d` the ordinary operating path. Build dependencies and the compiled application into the image; rebuild after edits rather than hot-mounting the checkout. Keep backend runtime state in separate volumes. Secrets stay in an ignored `.env`, and only the explicitly needed credential enters each service. Do not mount the host's entire Letta home or authentication directory.
-- Publish development ports on host loopback only. The container may listen on its own network interface without making the service publicly accessible.
-- SDK `local` mode runs inside the container. Connecting to the Mac's existing App Server uses `remote` mode; Cloud mode remains a separate configuration. Document this distinction.
-- SDK-local `harnessBackend: "api"` also runs inside the container, but uses Cloud agent state and models. The ordinary Compose pair uses this native option for its Cloud-backed service and `harnessBackend: "local"` for its local-state service. Provision dedicated test identities once; normal server startup continues to bind explicit IDs only.
-- Reuse a compact set of regression checks for retained behavior and one small direct-boundary smoke test. Use two configured agents to exercise isolation and bidirectional communication; do not import the lab's complete integration harness.
-- Keep generated logs, reports, test artifacts, dependencies, build output, and local state out of Git. No evidence bundles, verifier frameworks, or elaborate release machinery.
-- Start without live credentials using deterministic checks. Live runtime verification uses explicitly selected test agents and reports unavailable prerequisites rather than quietly borrowing production identities.
+Use focused tests first, demonstrate the intended failure where practical, make the smallest change, and rerun the retained inbound suite.
 
-## What already exists
+- Verify configuration rejection, no injected server tools, safe interactive denial, and unchanged agent/backend identity handling.
+- Use an external official SDK client to discover a card, submit a turn, observe streaming status and one final answer, continue a context, and read matching task state.
+- Keep failure/cancellation/restart answer-privacy tests, deadlines, shutdown ownership, partial-startup cleanup, and cross-owner/cross-binding access denial.
+- Keep inbound missing/wrong/valid bearer checks and distinct backend credentials.
+- Use the provider-free `--check` fixture for inbound HTTP/auth/protocol verification; paid disposable-agent trials remain separately opt-in. Historical trials are not new runtime validation.
+- On the documented toolchain, pass `npm ci`, `npm test` (Bun), `npm run check`, `npm run build`, and `npm run smoke:live -- --check`.
+- Inspect source, exports, built output, samples, and documentation: no supported outbound subsystem may remain. Remove dependencies only when no retained code needs them.
 
-- `packages/letta-a2a-bridge/`: A2A 1.0 JSON-RPC/SSE handling, SDK turn runner, task/context ownership, cancellation, optional push and durable state.
-- `packages/letta-a2a-client/`: outbound A2A client, context ownership, and `a2a_invoke` / `a2a_task` SDK tools.
-- `examples/14-typescript-letta-agent-sdk/src/server.ts`: the closest small direct-server composition, including session-owned outbound tools.
-- `services/bridge/src/index.ts` and `service-binding.ts`: an existing per-agent mounting pattern, but tied to lab OAuth, gateway routes, callbacks, and runtime setup.
+## Engineering constraints
 
-Extract these foundations and their relevant tests, not the entire lab. Retain MIT notices and applicable third-party attribution. Do not rewrite protocol serialization or lifecycle machinery merely to make the new repository look different.
+Use Effect v4 for typed configuration/errors, scoped services, resource ownership, and process lifecycle. Retain the official SDK adapters; do not rewrite protocol or recovery code for style. Await owned cleanup without confusing fiber interruption with confirmed remote cancellation. Follow the [v4 devtools guidance](https://effect.website/docs/v4/getting-started/devtools); exact tooling versions are in the development reference.
 
-Concrete adaptation points:
+Keep one Dockerfile and one Compose file. Ordinary `docker compose up -d` starts one configured agent; local-state and multi-binding choices remain explicit. Build source into the image, keep credentials in the environment, and retain runtime state in separate volumes. Never mount the host's entire Letta home.
 
-- The lab service finds/creates agents by display name. The new server binds explicit existing agent IDs and does not create or reconfigure agents implicitly.
-- The bridge currently accepts origin-only public URLs; the lab modifies cards separately to advertise mounted paths. Its `listenLoopback` helper also replaces advertised URLs with the bound loopback address. Let the new launcher own listening and exact public card URLs rather than treating that helper as a deployment API.
-- The lab's remote-only client setup, `/workspace`, test model, empty-tool agents, OAuth fixture, and mandatory callback settings are not general server defaults.
-- Historical live evidence is not verification of today's SDK or all three runtime modes.
+Keep the repository small: no orchestration framework, gateway dependency, OAuth stack, new auth system, global agent tooling, or evidence archive. Preserve MIT licensing and third-party attribution from the original [lab extraction](https://github.com/klittle32/letta-a2a/issues/2).
 
-## Phase 1 — verify the SDK seam and freeze the small scope (delivered)
+## Next: Phase 5 packaging
 
-**Goal:** establish the compatibility baseline before moving substantial code.
+After the server-only boundary passes review, verify a packed/installed artifact in a clean directory without checkout dependencies. Keep one clear install/start path and working single-agent/multi-binding instructions. Repository checks are not installed-package verification.
 
-- Inventory the relevant tests and rerun a focused baseline; distinguish pre-existing failures from extraction regressions.
-- Verify current SDK/Code APIs for existing-agent sessions, session-owned tools, close/abort behavior, and the three runtime choices below.
-- Run a bounded proof against an explicitly selected test agent: one inbound turn and one outbound A2A tool call. Exercise local, remote, and Cloud paths sufficiently to expose setup or external-tool blockers early. Do not use a production agent implicitly.
-- Confirm Cloud execution selection rather than assuming Cloud identity means managed-sandbox execution. Keep any unavailable path explicitly unverified; do not invent a fallback transport.
-- Choose minimum supported versions from actual verification. Use the issue's `>=` policy for Letta dependency/support declarations; keep exact tested combinations and reproducible lockfiles separate from those open-ended ranges.
-- Choose the ordinary noninteractive SDK permission configuration explicitly. Preserve existing approval/ownership safeguards without copying the lab's empty-tool restrictions onto every real agent or creating a new permission framework.
-
-**Done when:** there is a short compatibility matrix, a tested SDK integration seam, and a precise list of extraction changes. Any Cloud blocker is named before advertising Cloud support.
-
-Current registry observations, not verified compatibility: SDK `0.8.28`, Code `0.34.2`, A2A JS SDK `1.3.0`. The lab uses SDK `0.8.3` and A2A JS SDK `1.1.0`. SDK `0.8.28` itself pins Code `0.34.2`; distinguish that upstream packaging choice from this project's minimum-version policy. Do not force a broad A2A library/protocol upgrade into extraction unless necessary.
-
-## Phase 2 — extract one working, bidirectional server (delivered)
-
-**Goal:** a fresh local checkout can serve one existing agent and call one external peer, directly.
-
-- Bring over the bridge, outbound client/SDK adapter, and focused tests. Leave the Letta Code mod adapter and unrelated lab applications behind.
-- Add one runnable entry point, one configuration file format, environment-variable references for secrets, and clear startup errors.
-- Configure one existing agent, one backend connection, its public endpoint/card identity, and optional named outbound peers. An empty peer list simply means no outbound A2A tools.
-- Reuse the SDK adapter for outbound calls, binding tools to the actual ready conversation and awaiting their cleanup. Preserve bounded calls, cancellation propagation, and credential/destination restrictions.
-- Default the first quick start to loopback. Use a small independent A2A test peer, not a gateway stack.
-- Preserve the current text-only A2A 1.0 JSON-RPC/SSE profile and existing lifecycle semantics. Cards advertise only enabled capabilities; push callbacks are not mandatory.
-- October 2 approved streaming refinement: publish safe, observed activity as standard working-status messages, then one complete final answer artifact. Do not forward assistant token deltas or private reasoning/tool payloads. Keep failure, cancellation, and input/authentication-required outcomes distinct. This changes output presentation, not the transport or execution-ownership rules.
-
-**Done when:** an independent A2A client discovers the agent, sends a message, continues its context, and asks it to call a configured peer and return the result. No agentgateway, LiteLLM, Docker lab, global mod, or auto-created agent is required.
-
-## Phase 3 — configure several fixed agent bindings (delivered)
-
-**Delivered:** one process/port serves multiple fixed configured agents. The configuration and operational details are in [Configuration reference](docs/configuration.md).
-
-Single-agent and multi-binding configuration, optional inbound bearer authentication,
-mounted card discovery, startup validation, and binding-owned resources are
-implemented. The earlier local two-agent trial and its limits are summarized in
-[Development and support](docs/development.md). The deleted Phase 3 worktree and
-its activation procedure are historical; they are not setup instructions.
-
-Compose is image-based: `docker compose run` and `docker compose up -d` do not
-automatically rebuild an existing image after checkout changes. Run
-`docker compose build server` before using newly changed source. Activating rebuilt code in persistent
-services is separate approval. `docker compose up -d --build` rebuilds and may
-recreate both services. The host CLI's local endpoint uses host port `41242`,
-mapped to container port `41241`.
-
-**Delivered boundaries:** each binding owns its route, task/conversation namespace, SDK client, peer context, and tools. Configuration validates route collisions and computes advertised paths from explicit public URLs. Caller-to-server, server-to-Letta, and server-to-peer credentials remain separate. A shared token is one trust domain; bindings that reference the same agent share its memory.
-
-## Phase 4 — verify the complete runtime and protocol boundary (implementation delivered; activation pending)
-
-**Goal:** the same server configuration model works across the promised runtime choices. The implementation and Phase 4 checks are delivered; persistent-service activation remains separate approval. See [Development and support](docs/development.md) for the matrix evidence and its explicit unverified cases.
-
-| Mode | Runtime relationship |
-| --- | --- |
-| Local | SDK-managed local App Server; local state/execution; document the Code version supplied by the SDK. |
-| Remote | Already-running App Server; its own authentication, state backend, execution machine, and lifecycle. |
-| Cloud | Cloud agent/state with either a supported selected computer or managed sandbox; `cwd` belongs to that execution environment. |
-
-The Phase 4 implementation and its bounded runtime matrix were delivered at the
-base commit. The listed unverified combinations remain explicit limits; they are
-not a new Phase 4 completion gate. Activating persistent services is separate
-approval and does not imply that the Cloud service was activated. Evidence and
-unverified cases are in
-[Development and support](docs/development.md). Preserve the distinction between
-cancellation requested and backend execution confirmed stopped; interruption,
-disconnect, and successful turns do not prove remote stop.
-
-## Phase 5 — package and document the standalone product (pending)
-
-**Goal:** a new user can install it and make a successful direct call without studying the lab.
-
-- Verify an installed/packed artifact in a clean temporary directory, not only imports from the development checkout. One common install/start path; verify it without the source repository's dependencies present.
-- Keep a short product README and focused configuration/development references; avoid retaining internal worktree history or a new evidence archive.
-- Retain focused tests and modest CI, not the entire lab suite. Keep raw lab history, old evidence bundles, gateway configurations, Python/Hermes demos, OAuth fixtures, and deployment experiments in `letta-a2a`.
-- Review for unnecessary abstraction and configuration. Keep optional advanced capabilities out of the first quick start.
-- The public repository is authorized at project initialization. Add a link from the lab when the extraction is ready and that lab change is approved. npm publication or deployment remains a separate action, not implied by implementation.
-
-**Done when:** the packed artifact and one-agent/two-agent examples work from their instructions, licensing is intact, and all advertised behavior has evidence. Package publication and install parity have not been verified.
-
-## Explicit non-goals
-
-- Agent orchestration, schedulers, routing services, discovery directories, or dynamic tenants.
-- A custom model-provider layer, inference gateway, OAuth issuer, or generic plugin system.
-- New REST/gRPC bindings, protocol versions other than A2A 1.0, or rich media execution beyond the supported text-only profile.
-- Distributed persistence, automatic crash replay, high availability, or a new recovery subsystem.
-- Installing outbound A2A capabilities globally into unrelated Letta sessions.
-- Making agentgateway or LiteLLM work as part of the server's release gate.
-
-## Implementation rule
-
-Work phase by phase. For each behavior change, add/update a focused test first, confirm the intended failure when practical, implement the smallest change, then run the relevant regression checks. Extraction preserves existing tests and behavior; it is not permission for unrelated refactoring. Stop at genuine compatibility or product decisions, not for new process machinery.
-
-## Sources checked
-
-- [Issue #2](https://github.com/klittle32/letta-a2a/issues/2)
-- [Bridge foundation](https://github.com/klittle32/letta-a2a/tree/2972081/packages/letta-a2a-bridge)
-- [Outbound client and SDK adapter](https://github.com/klittle32/letta-a2a/tree/2972081/packages/letta-a2a-client)
-- [Direct SDK example](https://github.com/klittle32/letta-a2a/tree/2972081/examples/14-typescript-letta-agent-sdk)
-- [Current SDK deployment documentation](https://docs.letta.com/agent-sdk/deployment/index.md)
-- [Current SDK client-tool lifecycle documentation](https://docs.letta.com/agent-sdk/mcp/index.md)
-
-Initial planning evidence: source, documentation, and registry metadata were inspected; no tests or live runtimes were run during planning. Record implementation verification concisely in the README rather than adding a separate evidence archive.
+Registry publication, deployment, and changes to the source lab require separate approval.

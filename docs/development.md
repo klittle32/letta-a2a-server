@@ -2,7 +2,7 @@
 
 ## Toolchain and checks
 
-The automated suite covers startup, configuration, scoped shutdown, streaming, binding isolation, peer credentials, and recovery. Recovery checks use deterministic interruption checkpoints and fake SDK/peer execution; they are not live-backend crash or cancellation proofs.
+The automated suite covers startup, configuration, noninteractive approval denial, scoped shutdown, streaming, binding isolation, inbound credentials, and recovery. Recovery checks use deterministic interruption checkpoints and fake SDK execution; they are not live-backend crash or cancellation proofs. Test clients use the official A2A SDK to exercise inbound interfaces; there is no production outbound client.
 
 The recorded baseline used Node `24.19.0`, npm `11.17.0`, Bun `1.4.2` (test runner only), Letta Agent SDK `0.8.28`, bundled Code `0.34.2`, A2A SDK `1.1.0`, Effect and `@effect/platform-node` `4.0.0`, TypeScript `7.0.2`, and `@effect/tsgo` `0.48.0`. Live trials selected `openai/gpt-5.4-mini` explicitly. These are recorded versions, not a promise that every allowed SDK version was tested.
 
@@ -28,10 +28,15 @@ npm ci
 npm test
 npm run check
 npm run build
+npm run smoke:live -- --check
 node dist/main.js config.local.json
 ```
 
 For host-native execution, `config.local.json` must select an agent available to that host's backend, and `publicUrl` must match the listener's actual URL. Compose does not hot-mount source. In an editor, use the workspace TypeScript version so the Effect language-service plugin is available. If dependencies exist only in Docker, run `npm ci` in the host checkout and select its workspace compiler; no global TypeScript installation is required.
+
+`npm run build` replaces generated `dist/` output so deleted source modules cannot linger in the artifact. Do not store configuration or state there.
+
+Server-only verification on October 4, 2026 used a fresh dependency directory in Linux arm64: `npm ci`, all 87 tests, compiler checks, build, and provider-free `--check` passed. Compiled output contained no outbound client or injected-tool surface; all three configuration samples parsed, and native Node SQLite reopen/identity checks passed. Installation still emitted upstream dependency warnings. No live backend trial or persistent-service restart was performed for this change.
 
 ## Opt-in live fixtures
 
@@ -49,18 +54,17 @@ docker compose run --rm -e SMOKE_COMPUTER_DEVICE_ID=YOUR_DEVICE_ID -e SMOKE_CWD=
 
 Local uses a fresh temporary HOME. Remote starts an isolated authenticated App Server with local state. Cloud sandbox uses SDK-managed Cloud execution. Computer mode requires an explicit connected-computer ID and does not fall back to another machine; `SMOKE_CWD` belongs to that machine's filesystem. The selected computer must meet the fixture's Code minimum.
 
-The paired two-binding fixture runs against a temporary local backend and two disposable agents. The `--delegate` form adds authenticated A2A delegation from the first agent to the second and makes two additional model calls:
+The paired two-binding fixture runs inbound checks against a temporary local backend and two disposable agents:
 
 ```sh
 docker compose run --rm local node --import tsx scripts/smoke-bindings.ts openai/gpt-5.4-mini
-docker compose run --rm local node --import tsx scripts/smoke-bindings.ts openai/gpt-5.4-mini --delegate
 ```
 
 Close owned server/session resources before deleting disposable agents. Cleanup errors are reported. Successful turns do not prove backend cancellation or Cloud sandbox termination.
 
 ## Runtime evidence and limits
 
-The following is historical verification at commit `7890e9c8c7bd732c9c4235634000a84a5da3f055`, not a statement about currently running containers. Phase 4's implementation and bounded runtime checks are delivered. Rebuilding or activating any persistent service is a separate action.
+The following is historical verification at commit `7890e9c8c7bd732c9c4235634000a84a5da3f055`, before removal of the outbound subsystem. It does not validate the current server-only code or describe currently running containers. Historical delegation references below record past trials, not supported features. Live fixtures have been adapted but not rerun for this scope reduction. Rebuilding or activating any persistent service is a separate action.
 
 | Runtime check at the base commit | Evidence recorded | Boundary |
 | --- | --- | --- |
@@ -71,7 +75,7 @@ The following is historical verification at commit `7890e9c8c7bd732c9c4235634000
 | Earlier local API / Cloud identity | Compose Cloud-backed agent executed in Docker: answer, recall, status-first streaming, and retained IDs across service restart. | This is local API execution with Cloud identity, not SDK-managed Cloud sandbox; not an authenticated-peer Phase 4 rerun. |
 | Phase 3 persistent local pair | Host Go CLI trial on local routes: separate recall and task isolation, then streaming turns. | Last persistent local trial; distinct from disposable Phase 4 delegation. |
 
-The current provider-free fixture checks actual HTTP discovery and invocation, SDK-serialized security metadata, Bearer enforcement, `private, no-store`, and wrong-token `401`. It supersedes the base commit's weaker `--check` assertion; it does not replace live runtime verification.
+The provider-free fixture checks actual inbound HTTP discovery and invocation with a fake SDK: missing/wrong/valid bearer authentication, same-context continuation, status-first streaming with one final artifact, and matching task readback. It checks configuration mapping for four backend choices without executing them. It neither creates an agent nor makes a model call, and does not replace live runtime verification.
 
 Still unverified: live backend stop after cancellation; independent Cloud sandbox termination; connected-computer execution (the machine checked October 3 had M1P Desktop Code `0.33.6`, below fixture minimum `0.34.2`); Windows; public TLS/reverse-proxy operation; a remote App Server on a separate host; and live-model crash recovery. Credential reference names do not independently establish the actual backend principal or machine.
 

@@ -44,9 +44,6 @@ const backend = Schema.Union([
   Schema.Struct({ type: Schema.Literals(["remote"]), url: remoteUrl, tokenEnv: Schema.optional(envName) }),
   Schema.Struct({ type: Schema.Literals(["cloud"]), apiKeyEnv: Schema.optional(envName), computer: Schema.optional(computer) }),
 ]);
-const peerAuthSchema = Schema.Struct({ tokenEnv: envName, owner: identity });
-const peerSchema = Schema.Struct({ url: endpoint, auth: Schema.optional(peerAuthSchema) });
-const peersSchema = Schema.Record(nonEmpty, Schema.Union([endpoint, peerSchema]));
 const stateDirectory = nonEmpty;
 export const serverConfigSchema = Schema.Struct({
   agentId: identity,
@@ -57,8 +54,6 @@ export const serverConfigSchema = Schema.Struct({
     .pipe(Schema.withDecodingDefaultType(Effect.succeed(41241))),
   publicUrl: publicUrl.pipe(Schema.withDecodingDefaultType(Effect.succeed("http://127.0.0.1:41241/"))),
   stateDirectory: Schema.optional(stateDirectory),
-  peers: peersSchema.pipe(
-    Schema.withDecodingDefaultType(Effect.sync(() => ({})))),
 });
 
 export type ServerConfig = typeof serverConfigSchema.Type;
@@ -78,7 +73,6 @@ const bindingSchema = Schema.Struct({
   name: Schema.optional(identity),
   cwd: Schema.optional(nonEmpty),
   stateDirectory: Schema.optional(stateDirectory),
-  peers: peersSchema.pipe(Schema.withDecodingDefaultType(Effect.sync(() => ({})))),
   auth: Schema.optional(authSchema),
 });
 const applicationSchema = Schema.Struct({
@@ -97,17 +91,16 @@ export type ApplicationBindingConfig = {
   backend: ServerConfig["backend"];
   port: number;
   cwd?: string;
-  peers: Record<string, { url: string; auth?: { tokenEnv: string; owner: string } | undefined }>;
   stateDirectory?: string;
   auth?: { tokenEnv: string; owner: string };
 };
 export interface ApplicationConfig { port: number; publicUrl: string; bindings: ApplicationBindingConfig[] }
 
 function normalizeBinding(id: string, path: string, publicUrl: string, agentId: string, name: string,
-  backend: ServerConfig["backend"], port: number, peers: ServerConfig["peers"],
+  backend: ServerConfig["backend"], port: number,
   options: { cwd?: string; stateDirectory?: string; auth?: { tokenEnv: string; owner: string } } = {}): ApplicationBindingConfig {
   return { id, path, publicUrl: publicUrl.endsWith("/") ? publicUrl : `${publicUrl}/`, agentId, name, backend, port,
-    peers: normalizePeers(peers), ...(options.cwd ? { cwd: options.cwd } : {}),
+    ...(options.cwd ? { cwd: options.cwd } : {}),
     ...(options.stateDirectory ? { stateDirectory: options.stateDirectory } : {}),
     ...(options.auth ? { auth: options.auth } : {}) };
 }
@@ -118,7 +111,7 @@ export class ConfigurationError extends Schema.TaggedError<ConfigurationError>()
 
 function issueDetails(issue: SchemaIssue.Issue): Array<{ path: string; reason: string }> {
   const allowed = new Set(["agentId", "name", "backend", "type", "harnessBackend", "url", "tokenEnv", "apiKeyEnv",
-    "computer", "deviceId", "owner", "auth", "cwd", "port", "publicUrl", "stateDirectory", "peers", "connections",
+    "computer", "deviceId", "owner", "auth", "cwd", "port", "publicUrl", "stateDirectory", "connections",
     "bindings", "path", "connection"]);
   const walk = (current: SchemaIssue.Issue, path: string, budget: { left: number }): Array<{ path: string; reason: string }> => {
     if (budget.left <= 0) return [];
@@ -164,11 +157,14 @@ function decodeConfig<A>(schema: Schema.Codec<A, unknown, never, never>, value: 
 }
 
 export function parseConfig(value: unknown): ServerConfig {
+  if (isRecord(value) && Object.hasOwn(value, "peers")) throw unsupportedPeers();
   return decodeConfig(serverConfigSchema, value);
 }
 
 export function parseApplicationConfig(value: unknown): ApplicationConfig {
   try {
+    if (isRecord(value) && Object.hasOwn(value, "peers")) throw unsupportedPeers();
+    if (isRecord(value) && isRecord(value.bindings) && Object.values(value.bindings).some((binding) => isRecord(binding) && Object.hasOwn(binding, "peers"))) throw unsupportedPeers();
     if (isRecord(value) && "bindings" in value) {
       const decoded = decodeConfig(applicationSchema, value);
       if (!isLoopback(new URL(decoded.publicUrl)) &&
@@ -208,14 +204,14 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
           throw new ConfigurationError({ message: "Durable state directories must be separate" });
         if (resolvedStateDirectory) statePaths.push(resolvedStateDirectory);
         return normalizeBinding(id, raw.path, publicUrl, raw.agentId, raw.name ?? "Letta A2A Agent",
-          backendConfig, decoded.port, raw.peers, { ...(raw.cwd ? { cwd: raw.cwd } : {}),
+          backendConfig, decoded.port, { ...(raw.cwd ? { cwd: raw.cwd } : {}),
             ...(resolvedStateDirectory ? { stateDirectory: resolvedStateDirectory } : {}), ...(raw.auth ? { auth: raw.auth } : {}) });
       });
       return { port: decoded.port, publicUrl: decoded.publicUrl, bindings };
     }
     const singleAgent = decodeConfig(serverConfigSchema, value);
     return { port: singleAgent.port, publicUrl: singleAgent.publicUrl, bindings: [normalizeBinding("default", "", singleAgent.publicUrl,
-      singleAgent.agentId, singleAgent.name, singleAgent.backend, singleAgent.port, singleAgent.peers,
+      singleAgent.agentId, singleAgent.name, singleAgent.backend, singleAgent.port,
       { ...(singleAgent.cwd ? { cwd: singleAgent.cwd } : {}), ...(singleAgent.stateDirectory ? { stateDirectory: singleAgent.stateDirectory } : {}) })] };
   } catch (error) {
     if (error instanceof ConfigurationError) throw error;
@@ -244,40 +240,12 @@ function pathsOverlap(left: string, right: string): boolean {
   const a = resolve(left); const b = resolve(right);
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
-function normalizePeers(peers: ServerConfig["peers"]): ApplicationBindingConfig["peers"] {
-  return Object.fromEntries(Object.entries(peers).map(([name, peer]) => {
-    const value = typeof peer === "string" ? { url: peer } : peer;
-    return [name, value.auth ? { url: value.url, auth: value.auth } : { url: value.url }];
-  }));
+function unsupportedPeers(): ConfigurationError {
+  return new ConfigurationError({ message: "Invalid server configuration: Remove the unsupported 'peers' field; this server exposes configured Letta agents only" });
 }
-export function validatePeerConfiguration(peers: ApplicationBindingConfig["peers"], env: NodeJS.ProcessEnv): void {
-  const policies = new Map<string, string>();
-  for (const [alias, peer] of Object.entries(peers)) {
-    const url = new URL(peer.url);
-    if (peer.auth) {
-      if (url.protocol !== "https:" && !isLoopback(url)) throw new PeerConfigurationValidationError({ message: "Bearer peer auth requires HTTPS" });
-      const token = env[peer.auth.tokenEnv];
-      if (!token?.trim() || /[\r\n]/.test(token)) throw new PeerConfigurationValidationError({ message: "Required peer credential environment variable is missing or invalid" });
-    }
-    const signature = JSON.stringify(peer.auth ? [peer.auth.tokenEnv, peer.auth.owner] : null);
-    const canonicalEndpoint = url.href;
-    const prior = policies.get(canonicalEndpoint);
-    if (prior !== undefined && prior !== signature) throw new PeerConfigurationValidationError({ message: "Conflicting same-URL peer alias policies" });
-    policies.set(canonicalEndpoint, signature);
-    if (!alias.trim()) throw new PeerConfigurationValidationError({ message: "Invalid peer alias" });
-  }
-}
-export class PeerConfigurationValidationError extends Schema.TaggedError<PeerConfigurationValidationError>()("PeerConfigurationValidationError", {
-  message: Schema.String,
-}) {}
 export class SdkConfigurationError extends Schema.TaggedError<SdkConfigurationError>()("SdkConfigurationError", {
   message: Schema.String,
 }) {}
-export function validatePeerAliases(peers: ServerConfig["peers"], env: NodeJS.ProcessEnv): void {
-  const normalized = normalizePeers(peers);
-  validatePeerConfiguration(normalized, env);
-}
-
 export const loadConfig = Effect.fn("loadConfig")(function*(
   path: string,
 ): Effect.fn.Return<ServerConfig, ConfigurationError, FileSystem.FileSystem> {

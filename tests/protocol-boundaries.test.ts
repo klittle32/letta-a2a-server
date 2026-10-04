@@ -1,11 +1,10 @@
 import { expect, test } from "bun:test";
 import { Effect, Exit, Scope } from "effect";
 import type { LettaAgentClient, SDKMessage } from "@letta-ai/letta-agent-sdk";
-import { ListTasksRequest, Role, TaskState, type SendMessageRequest, type Task } from "@a2a-js/sdk";
+import { CancelTaskRequest, GetTaskRequest, ListTasksRequest, SubscribeToTaskRequest, TaskState, SendMessageRequest, type Task } from "@a2a-js/sdk";
 import { AgentSdkTurnRunner, LettaTurnCancelledError, type LettaTurnRequest } from "../src/bridge/letta-agent.js";
-import { agentMessage } from "../src/bridge/a2a-text.js";
 import { createBridge, listenLoopback } from "../src/bridge/bridge.js";
-import { createOfficialClientProvider } from "../src/client/index.js";
+import { testClient } from "./helpers/a2a-client.js";
 import { parseApplicationConfig } from "../src/config.js";
 import { startApplicationServer } from "../src/server.js";
 
@@ -15,11 +14,8 @@ function deferred() {
   return { promise, resolve };
 }
 function request(text: string, contextId: string = crypto.randomUUID(), messageId: string = crypto.randomUUID()): SendMessageRequest {
-  return {
-    tenant: "", metadata: undefined,
-    message: { ...agentMessage(text, "", contextId), role: Role.ROLE_USER, messageId },
-    configuration: { acceptedOutputModes: ["text/plain"], returnImmediately: false, taskPushNotificationConfig: undefined },
-  };
+  return SendMessageRequest.fromJSON({ message: { messageId, role: "user", parts: [{ text }], contextId },
+    configuration: { blocking: true, returnImmediately: false } });
 }
 function turn(contextId: string, signal = new AbortController().signal): LettaTurnRequest {
   return { a2aContextId: contextId, messageId: crypto.randomUUID(), text: contextId, signal, onAssistantText() {} };
@@ -111,20 +107,17 @@ test("disconnecting an HTTP stream does not cancel accepted work; GetTask retain
   });
   const listener = await listenLoopback(bridge);
   try {
-    const remote = await createOfficialClientProvider()(listener.url);
-    const stream = remote.sendMessageStream(request("hello"));
-    const initial = await stream.next();
-    expect(initial.value?.payload?.$case).toBe("task");
-    if (initial.value?.payload?.$case !== "task") throw new Error("Missing task");
-    const id = initial.value.payload.value.id;
+    const remote = await testClient(listener.url);
+    const accepted = await remote.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: crypto.randomUUID(), role: "user", parts: [{ text: "hello" }] }, configuration: { blocking: false, returnImmediately: true } }));
+    task(accepted);
+    const id = accepted.id;
     await entered.promise;
-    await stream.return();
-    await remote.getTask({ id, tenant: "", historyLength: 0 });
+    await remote.getTask(GetTaskRequest.fromJSON({ id, historyLength: 0 }));
     expect(canceled).toBe(false);
     release.resolve();
     let stored: Task | undefined;
     for (let i = 0; i < 100; i++) {
-      stored = await remote.getTask({ id, tenant: "", historyLength: 0 });
+      stored = await remote.getTask(GetTaskRequest.fromJSON({ id, historyLength: 0 }));
       if (stored.status?.state === TaskState.TASK_STATE_COMPLETED) break;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -146,16 +139,15 @@ test("CancelTask reports cancellation only after a cooperative runner confirms i
   });
   const listener = await listenLoopback(bridge);
   try {
-    const remote = await createOfficialClientProvider()(listener.url);
-    const submission = request("Wait until canceled");
-    submission.configuration!.returnImmediately = true;
+    const remote = await testClient(listener.url);
+    const submission = SendMessageRequest.fromJSON({ message: { messageId: crypto.randomUUID(), role: "user", parts: [{ text: "Wait until canceled" }] }, configuration: { blocking: false, returnImmediately: true } });
     const accepted = await remote.sendMessage(submission);
     task(accepted);
     await entered.promise;
-    const canceled = await remote.cancelTask({ id: accepted.id, tenant: "", metadata: undefined });
+    const canceled = await remote.cancelTask(CancelTaskRequest.fromJSON({ id: accepted.id }));
     expect(canceled.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
     expect(canceled.artifacts).toEqual([]);
-    const stored = await remote.getTask({ id: accepted.id, tenant: "", historyLength: 0 });
+    const stored = await remote.getTask(GetTaskRequest.fromJSON({ id: accepted.id, historyLength: 0 }));
     expect(stored.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
   } finally {
     expect((await listener.close()).complete).toBe(true);
@@ -187,11 +179,7 @@ test("task get, cancel, subscribe, and list stay isolated across authenticated b
   }) as unknown as LettaAgentClient, "127.0.0.1", { TOKEN_A: "key-a", TOKEN_B: "key-b" })
     .pipe(Effect.provideService(Scope.Scope, scope)));
   try {
-    const connect = (key: "a" | "b") => createOfficialClientProvider({
-      fetchImpl: Object.assign((input: string | URL | Request, init?: RequestInit) => fetch(input, {
-        ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer key-${key}` },
-      }), fetch),
-    })(server.bindings[key]!);
+    const connect = (key: "a" | "b") => testClient(server.bindings[key]!, `key-${key}`);
     const [a, b] = await Promise.all([connect("a"), connect("b")]);
     const [first, second] = await Promise.all([
       a.sendMessage(request("a", "same-context", "same-message")),
@@ -201,9 +189,9 @@ test("task get, cancel, subscribe, and list stay isolated across authenticated b
     expect(first.id).not.toBe(second.id);
     expect(opened.sort()).toEqual(["a", "b"]);
     for (const [remote, own, other] of [[a, first, second], [b, second, first]] as const) {
-      await expect(remote.getTask({ id: other.id, tenant: "", historyLength: 0 })).rejects.toThrow();
-      await expect(remote.cancelTask({ id: other.id, tenant: "", metadata: undefined })).rejects.toThrow();
-      const subscription = remote.resubscribeTask({ id: other.id, tenant: "" });
+      await expect(remote.getTask(GetTaskRequest.fromJSON({ id: other.id }))).rejects.toThrow();
+      await expect(remote.cancelTask(CancelTaskRequest.fromJSON({ id: other.id }))).rejects.toThrow();
+      const subscription = remote.resubscribeTask(SubscribeToTaskRequest.fromJSON({ id: other.id }));
       await expect(subscription.next()).rejects.toThrow();
       const listing = await remote.listTasks(ListTasksRequest.fromJSON({ pageSize: 100 }));
       expect(listing.tasks.map((item) => item.id)).toEqual([own.id]);

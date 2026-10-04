@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DurableBinding, executionContextKey } from "../src/bridge/durable-binding.js";
@@ -7,7 +7,7 @@ import { SqliteBindingStore } from "../src/bridge/sqlite-store.js";
 import { parseApplicationConfig } from "../src/config.js";
 import { Cause, Effect, Exit, Scope } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
-import { createA2AClient } from "../src/client/index.js";
+import { testClient, sendRequest } from "./helpers/a2a-client.js";
 import { startApplicationServer } from "../src/server.js";
 import { TaskState } from "@a2a-js/sdk";
 import { Message, Task } from "@a2a-js/sdk";
@@ -94,33 +94,35 @@ test("application restart restores completed tasks and resumes the SDK conversat
     return { scope, url: server.bindings.default! };
   };
   const first = await start(makeClient());
-  const caller = createA2AClient({ routes: { agent: first.url }, pollIntervalMs: 5 });
-  let initial: Awaited<ReturnType<typeof caller.invoke>>;
+  const caller = await testClient(first.url);
+  let initial: Task;
   try {
-    initial = await caller.invoke({ target: "agent", message: "first", localScope: "caller", signal: AbortSignal.timeout(5000) });
-    expect("id" in initial).toBe(true);
-    if (!("id" in initial)) throw new Error("Expected durable task response");
+    const response = await caller.sendMessage(sendRequest("first"));
+    expect("id" in response).toBe(true);
+    if (!("id" in response)) throw new Error("Expected durable task response");
+    initial = response;
     expect(initial.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(await readdir(root)).not.toContain("outbound-context.json");
   } finally {
-    caller.close();
     await Effect.runPromise(Scope.close(first.scope, Exit.void));
   }
+  // Existing outbound state is not ours to interpret, rewrite, or remove.
+  const unusedState = "untouched existing user state\n";
+  await writeFile(join(root, "outbound-context.json"), unusedState);
   const second = await start(makeClient());
-  const readback = createA2AClient({ routes: { agent: second.url }, pollIntervalMs: 5 });
+  const readback = await testClient(second.url);
   try {
-    if (!("id" in initial!)) throw new Error("Expected durable task response");
-    const task = await readback.task({ target: "agent", action: "get", taskId: initial.id,
-      localScope: "readback", signal: AbortSignal.timeout(5000) });
+    const task = await readback.getTask({ id: initial.id, tenant: "", historyLength: 0 });
     expect(task.id).toBe(initial.id);
     expect(task.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
-    const continued = await readback.invoke({ target: "agent", message: "continue", contextId: initial.contextId,
-      localScope: "continue", signal: AbortSignal.timeout(5000) });
-    expect(continued).toBeDefined();
+    const continued = await readback.sendMessage(sendRequest("continue", initial.contextId));
+    expect("status" in continued && continued.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
+    expect(continued.contextId).toBe(initial.contextId);
     expect(created).toBe(1);
     expect(resumed).toBe(1);
   } finally {
-    readback.close();
     await Effect.runPromise(Scope.close(second.scope, Exit.void));
+    expect(await readFile(join(root, "outbound-context.json"), "utf8")).toBe(unusedState);
     await rm(root, { recursive: true, force: true });
   }
 });

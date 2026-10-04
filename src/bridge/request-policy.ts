@@ -6,8 +6,6 @@ export interface TrustedCaller {
   readonly issuer: string;
   readonly subject: string;
   readonly tenant: string;
-  /** Optional application-verified delegation context; never part of the owner key. */
-  readonly delegation?: Readonly<{ hop: number; allowDelegation: boolean }>;
 }
 export type BridgeOperation =
   | Exclude<keyof A2ARequestHandler, "getAgentCard">
@@ -71,26 +69,10 @@ export class RequestPolicy {
         typeof projected.tenant !== "string"
       )
         throw new BridgeAccessError(401);
-      const delegation = projected.delegation;
-      if (
-        delegation &&
-        (!Number.isSafeInteger(delegation.hop) ||
-          delegation.hop < 0 ||
-          typeof delegation.allowDelegation !== "boolean")
-      )
-        throw new BridgeAccessError(403);
       caller = Object.freeze({
         issuer: projected.issuer,
         subject: projected.subject,
         tenant: projected.tenant,
-        ...(delegation
-          ? {
-              delegation: Object.freeze({
-                hop: delegation.hop,
-                allowDelegation: delegation.allowDelegation,
-              }),
-            }
-          : {}),
       });
       if (
         (params.tenant && params.tenant !== caller.tenant) ||

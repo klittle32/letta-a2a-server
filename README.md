@@ -1,68 +1,53 @@
 # Letta A2A Server
 
-Expose existing Letta agents through the [A2A](https://a2a-protocol.org/) protocol. The server accepts A2A requests, runs the selected agent with the Letta Agent SDK, and can give that session tools for calling configured A2A peers. Configure one agent directly or use named bindings for one or more agents on a shared listener.
+Expose configured, existing Letta agents through [A2A](https://a2a-protocol.org/). This server handles inbound A2A requests and adapts them to the Letta Agent SDK. Configure one agent directly or use named bindings for multiple agents on one listener.
 
-The application uses Effect 4 for configuration, resource ownership, and process lifecycle. The A2A and Letta SDKs handle protocol and agent execution. This is an early standalone server; it is not a multi-tenant security boundary or a claim of complete runtime parity. Package publication and installation from a registry remain pending.
+Calling other agents belongs in the Letta agent's own tools, not this server. There is no server-managed outbound client, peer routing, or A2A tool injection.
 
-## Quick start with Docker Compose
+## Quick start: one existing agent
 
-Requires Docker Compose and credentials for the two example runtimes. This setup runs both agents in Docker: one with Cloud state and one with local state. For Cloud sandbox or connected-computer execution, choose a different [runtime backend](docs/configuration.md#runtime-backends).
+Requires Docker Compose, a Letta API key, and an existing Cloud agent ID. The default service keeps agent state in Letta Cloud and executes in Docker—not a managed Cloud sandbox. Other [runtime backends](docs/configuration.md#runtime-backends) include fully local execution, a remote App Server, a Cloud sandbox, and a selected connected computer.
 
-1. Put `LETTA_API_KEY` and `OPENAI_API_KEY` in the ignored project-root `.env`. Compose passes only the Letta key to `server`, and only the OpenAI key to `local`.
-2. Copy the example configurations and set each `agentId` to an existing agent ID available to that service:
+1. Put `LETTA_API_KEY=your-key` in the ignored project-root `.env`.
+2. Copy the configuration and replace `agentId` with your existing agent's ID:
 
    ```sh
    cp config.cloud.example.json config.cloud.local.json
-   cp config.example.json config.local.json
    ```
 
-3. Build the shared image before provisioning or starting. Compose `run` and `up` do not automatically rebuild an existing image just because the checkout changed:
+3. Build and start the single default service:
 
    ```sh
    docker compose build server
-   ```
-
-4. If you need dedicated agents, provision each once with the Letta CLI. For example:
-
-   ```sh
-   docker compose run --rm server node_modules/.bin/letta --backend api agents create --name "A2A Compose Cloud" --model openai/gpt-5.4-mini
-   docker compose run --rm local node_modules/.bin/letta --backend local agents create --name "A2A Compose Local" --model openai/gpt-5.4-mini
-   ```
-
-   Put each returned ID in its matching config. A local agent must exist in the `local` service's runtime volume; it is separate from the host's Letta home. The server only connects to configured IDs and never creates agents on startup.
-
-5. Start both services:
-
-   ```sh
    docker compose up -d
    docker compose ps
    ```
 
-For a manual check, install the optional [official Go `a2a` CLI](https://github.com/a2aproject/a2a-cli) (tested with `0.3.0`), then send to either service:
+The server retrieves the configured agent; it never creates one on startup. The optional local-state service is enabled only when selected explicitly or through its `local` profile. See [configuration](docs/configuration.md) for local-state and multi-binding setup.
+
+For a manual check, install the optional [official Go `a2a` CLI](https://github.com/a2aproject/a2a-cli) (previously tested with `0.3.0`):
 
 ```sh
-a2a --endpoint http://127.0.0.1:41241/ --transport jsonrpc --timeout 120s send "Hello"
-a2a --endpoint http://127.0.0.1:41242/ --transport jsonrpc --timeout 120s send --stream "Hello"
+a2a --endpoint http://127.0.0.1:41241/ --transport jsonrpc --timeout 120s send --stream "Hello"
 ```
 
-Compose maps host port `41242` to container port `41241` for the local service; use `41242` from the host. Streaming reports safe activity followed by one complete answer. It does not stream answer tokens.
+Streaming reports safe activity followed by one complete answer; it does not expose provisional answer tokens.
 
-For logs, restart, stop, or rebuild:
+## Operations and configuration
 
 ```sh
-docker compose logs -f
-docker compose restart
+docker compose logs -f server
+docker compose restart server
+docker compose up -d --build server
 docker compose down
-docker compose up -d --build
 ```
 
-`down` retains volumes and agent state; avoid `down -v` unless you intend to erase local state. `docker compose up -d --build` rebuilds and may recreate both services. To rebuild only the shared image without activating it, use `docker compose build server`; a service-specific `up -d --build local` rebuilds and recreates only `local`.
+Source is built into the image; restart alone does not pick up code changes. `down` retains volumes; avoid `down -v` unless you intend to erase local state. Both service definitions share an image tag, so select the service you intend to update.
 
-## Configuration and limits
+- [Configuration reference](docs/configuration.md): runtimes, named bindings, inbound/backend credentials, advertised URLs, persistence, and removal of obsolete `peers` settings.
+- [Development and support](docs/development.md): checks, opt-in live fixtures, and verification limits.
+- [Scope and acceptance plan](PLAN.md): the server-only product boundary and pending packaging work.
 
-- [Configuration reference](docs/configuration.md): single-agent and multi-binding formats, local/remote/Cloud runtimes, authentication, peers, persistence, and advertised URLs.
-- [Development and support](docs/development.md): Effect toolchain, checks, historical runtime evidence, and unverified cases.
+Compose publishes ports on host loopback. Bearer authentication does not add TLS, process isolation, or multi-tenant security. Bindings to the same Letta agent share its memory. A2A task/context mappings reset on restart unless durable state is configured. Interrupted work is not automatically replayed, and interruption does not prove the backend stopped.
 
-Compose publishes both ports on host loopback. This is a development trust assumption, not a network security guarantee. Bearer authentication does not add TLS, isolate SDK child processes, or make bindings multi-tenant. Bindings to the same Letta agent share its memory. A2A task and context mappings reset on restart unless durable state is configured. Interrupted work is not automatically replayed, and interruption does not prove the backend stopped. No agent is created implicitly.
-
-MIT licensing and third-party notices are retained in the repository.
+Effect 4 owns configuration and resource lifecycle; the official A2A and Letta SDKs handle protocol and execution. Registry publication and installed-package verification remain pending. MIT licensing and third-party notices are retained.

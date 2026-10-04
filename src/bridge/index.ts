@@ -25,12 +25,6 @@ export {
 } from "./letta-agent.js";
 export { DurableBinding, type RecoveryRecord } from "./durable-binding.js";
 export { readText, textPart, agentMessage } from "./a2a-text.js";
-export { createToolPolicy, createAgentToolGuard } from "./tool-policy.js";
-export {
-  delegationPolicy,
-  DELEGATION_HOP_HEADER,
-  type DelegationInput,
-} from "./delegation.js";
 export {
   createPushNotifications,
   type PushNotificationsOptions,

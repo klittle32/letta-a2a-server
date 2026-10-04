@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effect, FileSystem, Schema } from "effect";
-import { ConfigurationError, loadApplicationConfig, loadConfig, parseApplicationConfig, parseConfig, sdkOptions, serverConfigSchema, validatePeerAliases } from "../src/config.js";
+import { ConfigurationError, loadApplicationConfig, loadConfig, parseApplicationConfig, parseConfig, sdkOptions, serverConfigSchema } from "../src/config.js";
 
 const base = { agentId: "agent-example", backend: { type: "local" } };
 
@@ -67,11 +67,10 @@ describe("server configuration", () => {
   test("preserves defaults, trimming, optional fields, and exact URL output", () => {
     const config = parseConfig({ ...base, agentId: " agent-example ", name: " Agent ",
       port: 0, publicUrl: "http://127.0.0.1:80", cwd: "/work",
-      peers: { helper: "https://peer.example/path" },
     });
     expect(config).toEqual({ agentId: "agent-example", name: "Agent", backend: { type: "local" },
-      port: 0, publicUrl: "http://127.0.0.1/", cwd: "/work", peers: { helper: "https://peer.example/path" } });
-    expect(parseConfig({ ...base, name: undefined, port: undefined, peers: undefined }).name)
+      port: 0, publicUrl: "http://127.0.0.1/", cwd: "/work" });
+    expect(parseConfig({ ...base, name: undefined, port: undefined }).name)
       .toBe("Letta A2A Agent");
     expect(parseConfig(base).port).toBe(41241);
     expect(parseConfig(base)).not.toHaveProperty("cwd");
@@ -86,14 +85,25 @@ describe("server configuration", () => {
     }
   });
 
-  test("normalizes authenticated peer aliases and durable state directories", () => {
-    const config = parseApplicationConfig({ ...base, stateDirectory: "/var/lib/letta-a2a", peers: {
-      helper: { url: "https://peer.example/rpc", auth: { tokenEnv: "PEER_TOKEN", owner: "helper-service" } },
-    } });
-    expect(config.bindings[0]?.peers).toEqual({ helper: {
-      url: "https://peer.example/rpc", auth: { tokenEnv: "PEER_TOKEN", owner: "helper-service" },
-    } });
-    expect(config.bindings[0]?.stateDirectory).toBe("/var/lib/letta-a2a");
+  test("rejects peers at every configuration level with a sanitized removal instruction", () => {
+    const application = { connections: { local: { type: "local" } },
+      bindings: { a: { path: "/a", connection: "local", agentId: "existing-agent" } } };
+    const cases: unknown[] = [
+      { ...base, peers: {} },
+      { ...base, peers: { helper: "https://secret-peer.example/SECRET" } },
+      { ...application, bindings: { a: { ...application.bindings.a, peers: {} } } },
+      { ...application, bindings: { a: { ...application.bindings.a, peers: { helper: "https://secret-peer.example/SECRET" } } } },
+      { ...application, peers: {} },
+    ];
+    for (const input of cases) {
+      try { parseApplicationConfig(input); throw new Error("expected rejected peers config"); }
+      catch (error) {
+        expect(error).toBeInstanceOf(ConfigurationError);
+        expect((error as ConfigurationError).message).toContain("Remove the unsupported 'peers' field");
+        expect(JSON.stringify(error)).not.toMatch(/secret-peer|SECRET/);
+      }
+    }
+    expect(() => parseConfig({ ...base, peers: {} })).toThrow("Remove the unsupported 'peers' field");
   });
   test("rejects unsafe binding IDs and state directory overlap", () => {
     for (const id of [".", "..", "../escape"]) {
@@ -119,9 +129,6 @@ describe("server configuration", () => {
       ...[-1, 65536, 1.5, NaN, Infinity].map((port) => ({ ...base, port })),
       ...["http://127.0.0.1/path", "http://127.0.0.1?secret-marker", "http://127.0.0.1#secret-marker",
         "http://user:secret-marker@127.0.0.1"].map((publicUrl) => ({ ...base, publicUrl })),
-      ...["file:///tmp/secret-marker", "https://peer.example#secret-marker", "not-a-url"].map((url) =>
-        ({ ...base, peers: { helper: url } })),
-      { ...base, peers: { "": "https://peer.example" } },
     ]) {
       expect(() => parseConfig(input)).toThrow(ConfigurationError);
       try { parseConfig(input); } catch (error) {
@@ -189,7 +196,6 @@ describe("server configuration", () => {
   });
   test("schema diagnostics identify bounded paths and reasons without values", () => {
     for (const [input, expected] of [
-      [{ ...base, peers: { helper: "file://secret-value" } }, "peers (invalid value)"],
       [{ ...base, backend: { type: "remote", tokenEnv: "SECRET_ENV" } }, "backend (invalid value)"],
       [{ ...base, backend: { type: "secret-discriminant" } }, "backend"],
       [{ ...base, backend: { type: "local", secretField: "secret-value" } }, "backend (invalid value)"],
@@ -201,25 +207,10 @@ describe("server configuration", () => {
       }
     }
   });
-  test("peer validation exposes safe typed reasons without credential names or causes", () => {
-    const peers = { helper: { url: "https://peer.example", auth: { tokenEnv: "SECRET_PEER_TOKEN", owner: "helper" } } };
-    try { validatePeerAliases(peers, {}); throw new Error("expected peer failure"); }
-    catch (error) {
-      expect((error as Error).message).toContain("environment variable is missing or invalid");
-      expect(String(error)).not.toContain("SECRET_PEER_TOKEN");
-    }
-    const conflict = { ...peers, alternate: { url: "https://peer.example/", auth: { tokenEnv: "OTHER_TOKEN", owner: "other" } } };
-    try { validatePeerAliases(conflict, { SECRET_PEER_TOKEN: "ok", OTHER_TOKEN: "ok" }); throw new Error("expected conflict"); }
-    catch (error) {
-      expect((error as Error).message).toContain("Conflicting same-URL peer alias policies");
-      expect(String(error)).not.toContain("OTHER_TOKEN");
-    }
-  });
   test("binds an existing agent and defaults to direct loopback", () => {
     const config = parseConfig(base);
     expect(config.agentId).toBe("agent-example");
     expect(config.publicUrl).toBe("http://127.0.0.1:41241/");
-    expect(config.peers).toEqual({});
     expect(sdkOptions(config.backend, {})).toEqual({ backend: "local" });
   });
 
@@ -279,8 +270,7 @@ describe("server configuration", () => {
       .toBe("http://127.0.0.1:4242/");
   });
 
-  test("single-agent configuration requires loopback URLs and rejects credential-bearing peer URLs", () => {
+  test("single-agent configuration requires loopback URLs", () => {
     expect(() => parseConfig({ ...base, publicUrl: "https://public.example" })).toThrow();
-    expect(() => parseConfig({ ...base, peers: { helper: "https://peer.example?token=secret" } })).toThrow();
   });
 });

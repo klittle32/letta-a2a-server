@@ -3,6 +3,5 @@
   "name": "Local-backend Letta Agent",
   "backend": { "type": "local", "harnessBackend": "local" },
   "publicUrl": "http://127.0.0.1:41242/",
-  "port": 41241,
-  "peers": {}
+  "port": 41241
 }

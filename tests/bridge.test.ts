@@ -131,7 +131,6 @@ describe("session-owned tool resources", () => {
 import assert from "node:assert/strict";
 import { setImmediate } from "node:timers/promises";
 import type { SDKMessage } from "@letta-ai/letta-agent-sdk";
-import { createToolPolicy } from "../src/bridge/tool-policy.js";
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>((r) => {
@@ -180,7 +179,7 @@ function runnerFixture(sessions: Session[]) {
     resumeSession: take,
   } as unknown as LettaAgentClient;
   const runner = new AgentSdkTurnRunner(client, "agent", {
-    sessionOptions: createToolPolicy([]),
+    sessionOptions: () => ({ options: {}, async close() {} }),
     sharingDomain: "test",
   });
   const run = (

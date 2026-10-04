@@ -143,3 +143,29 @@ test("launcher preserves safe backend credential errors before client creation",
   expect(await Effect.runPromise(program)).toBe("Required backend credential environment variable is missing");
   expect(created).toBe(false);
 });
+
+test("launcher rejects peers before constructing any SDK client", async () => {
+  for (const config of [
+    { agentId: "existing", backend: { type: "local" }, peers: {} },
+    { connections: { local: { type: "local" } }, bindings: {
+      a: { path: "/a", connection: "local", agentId: "existing", peers: {} },
+    } },
+    { peers: {}, connections: { local: { type: "local" } }, bindings: {
+      a: { path: "/a", connection: "local", agentId: "existing" },
+    } },
+  ]) {
+    let created = false;
+    const program = applicationProgram("unused.json", () => {
+      created = true;
+      throw new Error("must not construct client");
+    }, "127.0.0.1", {}).pipe(
+      Effect.provideService(FileSystem.FileSystem, FileSystem.makeNoop({
+        readFileString: () => Effect.succeed(JSON.stringify(config)),
+      })),
+      Effect.catchTag("ConfigurationError", (error) => Effect.succeed(error.message)),
+    );
+    const message = await Effect.runPromise(program);
+    expect(message).toContain("Remove the unsupported 'peers' field");
+    expect(created).toBe(false);
+  }
+});

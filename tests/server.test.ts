@@ -2,10 +2,9 @@ import { expect, spyOn, test } from "bun:test";
 import { Cause, Effect, Exit, Scope } from "effect";
 import type { CreateSessionOptions, LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AGENT_CARD_PATH } from "@a2a-js/sdk";
-import { Role } from "@a2a-js/sdk";
+import { TaskState } from "@a2a-js/sdk";
 import { parseApplicationConfig, parseConfig } from "../src/config.js";
-import { createA2AClient } from "../src/client/index.js";
-import { createOfficialClientProvider } from "../src/client/a2a-invoker.js";
+import { testClient, sendRequest } from "./helpers/a2a-client.js";
 import { startApplicationServer, startServer, acquireSdkClient, withTurnDeadline } from "../src/server.js";
 import { AgentSdkTurnRunner } from "../src/bridge/letta-agent.js";
 
@@ -142,13 +141,21 @@ test("active-turn interruption awaits session disposal before client close", asy
     return yield* Effect.never;
   })), { signal: controller.signal });
   await listeningStarted;
-  const remote = createA2AClient({ routes: { test: url } });
-  const call = remote.invoke({ target: "test", message: "hello", localScope: "owner", signal: AbortSignal.timeout(10000) })
-    .catch(() => undefined);
+  const remote = await testClient(url);
+  const waitFor = async (promise: Promise<void>, label: string) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 2_000);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
   try {
-    await started;
+    await remote.sendMessage(sendRequest("hello", undefined, true));
+    await waitFor(started, "SDK send");
+    // Shutdown itself must interrupt the active turn; do not pre-cancel it.
     controller.abort();
-    await disposalStarted;
+    await waitFor(disposalStarted, "session disposal");
     expect(events).toContain("abort requested");
     expect(events).not.toContain("client closed");
     release();
@@ -162,20 +169,21 @@ test("active-turn interruption awaits session disposal before client close", asy
   } finally {
     release();
     controller.abort();
-    remote.close();
-    await call;
     await running;
   }
 }, 15000);
 
 for (const failure of ["none", "client", "bridge"] as const) {
   test(`NodeRuntime SIGTERM awaits owned layer cleanup; failure=${failure}`, async () => {
+    const serverModuleUrl = new URL("../src/server.ts", import.meta.url).href;
+    const configModuleUrl = new URL("../src/config.ts", import.meta.url).href;
+    const helperModuleUrl = new URL("./helpers/a2a-client.ts", import.meta.url).href;
     const script = `
       import { Effect } from "effect";
       import { NodeRuntime } from "@effect/platform-node";
-      import { Server } from "./src/server.ts";
-      import { parseConfig } from "./src/config.ts";
-      import { createA2AClient } from "./src/client/index.ts";
+      import { Server } from ${JSON.stringify(serverModuleUrl)};
+      import { parseConfig } from ${JSON.stringify(configModuleUrl)};
+      import { testClient, sendRequest } from ${JSON.stringify(helperModuleUrl)};
       const config = parseConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
       const open = () => ({
         async ready() { return { conversationId: "signal-conversation" }; },
@@ -198,11 +206,8 @@ for (const failure of ["none", "client", "bridge"] as const) {
         const server = yield* Server;
         if (${failure === "bridge"}) {
           yield* Effect.tryPromise(async () => {
-            const remote = createA2AClient({ routes: { test: server.url } });
-            try {
-              await remote.invoke({ target: "test", message: "hello", localScope: "signal-owner", signal: AbortSignal.timeout(5000) })
-                .catch(() => undefined);
-            } finally { remote.close(); }
+            const remote = await testClient(server.url);
+            await remote.sendMessage(sendRequest("hello")).catch(() => undefined);
           });
         }
         yield* Effect.sync(() => process.stdout.write("ready\\n"));
@@ -218,7 +223,7 @@ for (const failure of ["none", "client", "bridge"] as const) {
     try {
       while (!output.includes("ready\n")) {
         const chunk = await reader.read();
-        if (chunk.done) throw new Error(`Signal fixture exited before readiness: ${output}`);
+        if (chunk.done) throw new Error(`Signal fixture exited before readiness: ${output}${await new Response(child.stderr).text()}`);
         output += decoder.decode(chunk.value);
       }
       child.kill("SIGTERM");
@@ -267,28 +272,29 @@ test("direct discovery and two turns use an existing agent and preserve conversa
   const scope = await Effect.runPromise(Scope.make());
   const server = await Effect.runPromise(startServer(parseConfig({
     agentId: "agent-test", backend: { type: "local" }, port: 0,
-    publicUrl: "http://127.0.0.1:0", peers: { helper: "http://127.0.0.1:9999" },
+    publicUrl: "http://127.0.0.1:0",
   }), client).pipe(Effect.provideService(Scope.Scope, scope)));
-  const remote = createA2AClient({ routes: { test: server.url }, pollIntervalMs: 10 });
+  const remote = await testClient(server.url);
   try {
     const response = await fetch(`${server.url}/${AGENT_CARD_PATH}`);
     expect(response.ok).toBe(true);
     const card = await response.json() as { supportedInterfaces: { url: string }[] };
     expect(card.supportedInterfaces[0]?.url).toBe(`${server.url}/`);
-    const signal = new AbortController().signal;
-    const first = await remote.invoke({ target: "test", message: "hello", localScope: "caller", signal });
-    const second = await remote.invoke({ target: "test", message: "again", localScope: "caller", signal });
+    const first = await remote.sendMessage(sendRequest("hello"));
+    const second = await remote.sendMessage(sendRequest("again", first.contextId));
     expect(second.contextId).toBe(first.contextId);
     expect(opened).toEqual(["agent-test", "conv-test"]);
     expect(disposals).toBe(2);
     const options = sessionOptions[0]!;
-    expect(options.tools?.map((tool) => tool.name)).toEqual(["a2a_invoke", "a2a_task"]);
+    expect(options.tools).toBeUndefined();
     expect(options.permissionMode).toBe("standard");
-    expect(options.allowedTools).toBeUndefined(); // Preserve the agent's normal tools/skills.
-    expect((await options.canUseTool!("a2a_invoke", {})).behavior).toBe("allow");
-    expect((await options.canUseTool!("Bash", {})).behavior).toBe("deny");
+    expect(options.allowedTools).toBeUndefined();
+    expect(options.toolset).toBeUndefined();
+    expect(options.skillSources).toBeUndefined();
+    for (const tool of ["a2a_invoke", "Bash", "nativeBash"]) {
+      expect((await options.canUseTool!(tool, {})).behavior).toBe("deny");
+    }
   } finally {
-    remote.close();
     await Effect.runPromise(Scope.close(scope, Exit.void));
     expect(clientCloses).toBe(0); // Injected clients remain caller-owned.
   }
@@ -324,7 +330,7 @@ test("application deadline aborts sent memory and SQLite-backed sessions", async
       publicUrl: "http://127.0.0.1:0", ...(durable ? { stateDirectory: join(root, "sqlite") } : {}) });
     const scope = await Effect.runPromise(Scope.make());
     const server = await Effect.runPromise(startApplicationServer(config, () => client).pipe(Effect.provideService(Scope.Scope, scope)));
-    const remote = createA2AClient({ routes: { target: server.bindings.default! }, pollIntervalMs: 5 });
+    const remote = await testClient(server.bindings.default!);
     const timeout = spyOn(AbortSignal, "timeout");
     try {
       let fireDeadline!: () => void;
@@ -334,41 +340,29 @@ test("application deadline aborts sent memory and SQLite-backed sessions", async
         if (ms === 120_000) { fireDeadline = () => deadline.abort(new Error("deadline")); return deadlineSignal; }
         return originalTimeout.call(AbortSignal, ms);
       });
-      const invocation = remote.invoke({ target: "target", message: "wait", localScope: "deadline", signal: new AbortController().signal });
+      const invocation = remote.sendMessage(sendRequest("wait"));
       // A failed assertion must still leave shutdown free to reject this call.
       void invocation.catch(() => undefined);
       await started;
       expect(sent).toBe(true);
       expect(fireDeadline).toBeTypeOf("function");
       fireDeadline();
-      await expect(invocation).rejects.toThrow();
+      const result = await invocation;
+      expect("status" in result).toBe(true);
+      if (!("status" in result)) throw new Error("Expected terminal task after deadline");
+      expect(result.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+      expect(result.artifacts).toEqual([]);
       expect(aborted).toBe(true);
       expect(disposed).toBe(true);
     } finally {
       timeout.mockRestore();
-      remote.close();
       await Effect.runPromise(Scope.close(scope, Exit.void));
       expect(closed).toBe(true); // Application factory clients belong to the launcher scope.
     }
   } } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("expected peer configuration errors fail in the typed channel", async () => {
-  const client = { agents: { async retrieve(id: string) { return { id }; } }, async close() {} } as unknown as LettaAgentClient;
-  const peerConfig = parseConfig({ agentId: "agent", backend: { type: "local" }, port: 0, peers: { helper: {
-    url: "http://peer.example/", auth: { tokenEnv: "MISSING_PEER_TOKEN", owner: "peer" },
-  } } });
-  const peerExit = await Effect.runPromiseExit(Effect.scoped(startServer(peerConfig, client)));
-  expect(Exit.isFailure(peerExit)).toBe(true);
-  if (Exit.isFailure(peerExit)) {
-    expect(Cause.hasFails(peerExit.cause)).toBe(true);
-    expect(Cause.hasDies(peerExit.cause)).toBe(false);
-    expect(Cause.squash(peerExit.cause)).toMatchObject({ _tag: "PeerConfigurationError" });
-  }
-});
-
-for (const kind of ["peer", "inbound"] as const) {
-  test(`application ${kind} configuration failure is typed and closes only acquired clients`, async () => {
+test("application inbound configuration failure is typed and closes acquired clients", async () => {
     let created = 0;
     let closed = 0;
     const auth = { tokenEnv: "MISSING_A2A_TOKEN", owner: "test" };
@@ -378,7 +372,7 @@ for (const kind of ["peer", "inbound"] as const) {
       connections: { local: { type: "local" } },
       bindings: { test: {
         path: "", connection: "local", agentId: "existing-agent",
-        ...(kind === "inbound" ? { auth } : { peers: { helper: { url: "http://127.0.0.1:9", auth } } }),
+        auth,
       } },
     });
     const createClient = () => {
@@ -395,12 +389,11 @@ for (const kind of ["peer", "inbound"] as const) {
     if (Exit.isFailure(exit)) {
       expect(Cause.hasFails(exit.cause)).toBe(true);
       expect(Cause.hasDies(exit.cause)).toBe(false);
-      expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "PeerConfigurationError" });
+      expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "InboundAuthenticationConfigurationError" });
     }
-    expect(created).toBe(kind === "peer" ? 0 : 1);
+    expect(created).toBe(1);
     expect(closed).toBe(created);
-  });
-}
+});
 
 test("turn deadline retains an incoming A2A abort signal", async () => {
   let aborted = false;
@@ -461,10 +454,11 @@ test("one listener mounts independent bindings under a public prefix and protect
     expect(denied.status).toBe(401);
     const bad = await fetch(`${application.bindings.a}/`, { method: "POST", headers: { authorization: "Basic x" } });
     expect(bad.status).toBe(401);
-    const peerA = await createOfficialClientProvider({ fetchImpl: ((input, init) => fetch(input, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), authorization: "Bearer secret-a" } })) as typeof fetch })(application.bindings.a!);
-    const peerB = await createOfficialClientProvider({ fetchImpl: ((input, init) => fetch(input, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), authorization: "Bearer secret-b" } })) as typeof fetch })(application.bindings.b!);
-    await peerA.sendMessage({ tenant: "", metadata: undefined, message: { messageId: "same-message", role: Role.ROLE_USER, parts: [{ content: { $case: "text", value: "a" }, mediaType: "text/plain", metadata: undefined, filename: "" }], contextId: "same-context", taskId: "", extensions: [], metadata: undefined, referenceTaskIds: [] }, configuration: { acceptedOutputModes: ["text/plain"], taskPushNotificationConfig: undefined, returnImmediately: false } });
-    await peerB.sendMessage({ tenant: "", metadata: undefined, message: { messageId: "same-message", role: Role.ROLE_USER, parts: [{ content: { $case: "text", value: "b" }, mediaType: "text/plain", metadata: undefined, filename: "" }], contextId: "same-context", taskId: "", extensions: [], metadata: undefined, referenceTaskIds: [] }, configuration: { acceptedOutputModes: ["text/plain"], taskPushNotificationConfig: undefined, returnImmediately: false } });
+    await expect(testClient(application.bindings.a!, "wrong-token")).rejects.toThrow();
+    const peerA = await testClient(application.bindings.a!, "secret-a");
+    const peerB = await testClient(application.bindings.b!, "secret-b");
+    await peerA.sendMessage(sendRequest("a", "same-context"));
+    await peerB.sendMessage(sendRequest("b", "same-context"));
     expect(sessions).toEqual(["a", "b"]);
   } finally {
     const close = Effect.runPromise(Scope.close(scope, Exit.void));
@@ -496,12 +490,10 @@ test("single-agent root binding serves health, card discovery, and invocation", 
     expect(card.status).toBe(200);
     const body = await card.json() as { name: string };
     expect(body.name).toBe("Letta A2A Agent");
-    const remote = createA2AClient({ routes: { root: server.bindings.default! }, pollIntervalMs: 10 });
-    try {
-      const result = await remote.invoke({ target: "root", message: "hello", localScope: "test", signal: AbortSignal.timeout(5000) });
-      expect(result).toBeDefined();
-      expect(opened).toEqual(["turn"]);
-    } finally { remote.close(); }
+    const remote = await testClient(server.bindings.default!);
+    const result = await remote.sendMessage(sendRequest("hello"));
+    expect(result).toBeDefined();
+    expect(opened).toEqual(["turn"]);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
   }
@@ -534,118 +526,6 @@ test("partial multi-binding startup failure closes every acquired SDK client", a
   }
   expect(closed.sort()).toEqual(["first", "second"]);
 });
-
-test("production aliases on one authenticated endpoint reuse their policy provider", async () => {
-  const config = parseApplicationConfig({ agentId: "agent-test", backend: { type: "local" },
-    peers: {
-      first: { url: "http://127.0.0.1:49991/peer", auth: { tokenEnv: "PEER_TOKEN", owner: "peer-service" } },
-      second: { url: "http://127.0.0.1:49991/peer", auth: { tokenEnv: "PEER_TOKEN", owner: "peer-service" } },
-    },
-  });
-  const client = { agents: { retrieve: async (id: string) => ({ id }) }, createSession() {}, async close() {} } as unknown as LettaAgentClient;
-  const scope = await Effect.runPromise(Scope.make());
-  const server = await Effect.runPromise(startApplicationServer(config, () => client, "127.0.0.1", { PEER_TOKEN: "private" })
-    .pipe(Effect.provideService(Scope.Scope, scope)));
-  expect(server.bindings.default).toBeDefined();
-  await Effect.runPromise(Scope.close(scope, Exit.void));
-});
-
-test("production peer tools separate same-origin identities and share identical URL aliases", async () => {
-  const peerConfig = parseApplicationConfig({ publicUrl: "http://127.0.0.1:0/peer", port: 0,
-    connections: { local: { type: "local" } }, bindings: {
-      one: { path: "/one", connection: "local", agentId: "peer-one", auth: { tokenEnv: "ONE_IN", owner: "shared-peer-owner" } },
-      two: { path: "/two", connection: "local", agentId: "peer-two", auth: { tokenEnv: "TWO_IN", owner: "shared-peer-owner" } },
-    },
-  });
-  const peerScope = await Effect.runPromise(Scope.make());
-  const peerServer = await Effect.runPromise(startApplicationServer(peerConfig, () => peerClient(), "127.0.0.1", {
-    ONE_IN: "peer-one-bearer", TWO_IN: "peer-two-bearer",
-  }).pipe(Effect.provideService(Scope.Scope, peerScope)));
-  const oneUrl = peerServer.bindings.one!;
-  const twoUrl = peerServer.bindings.two!;
-  expect(new URL(oneUrl).origin).toBe(new URL(twoUrl).origin);
-  const peerRequests: Array<{ url: string; authorization: string | null }> = [];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = ((input: Request | URL | string, init?: RequestInit) => {
-    const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
-    if (url.origin === new URL(oneUrl).origin) {
-      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-      peerRequests.push({ url: url.href, authorization: headers.get("authorization") });
-    }
-    return originalFetch(input, init);
-  }) as typeof fetch;
-
-  const outputs: string[] = [];
-  const toolErrors: boolean[] = [];
-  const outerClient = {
-    agents: { retrieve: async (id: string) => ({ id }) },
-    createSession: (_agentId: string, options: CreateSessionOptions) => ({
-      async ready() { return { conversationId: "outer-conversation" }; },
-      async send() {
-        const invoke = options.tools?.find((tool) => tool.name === "a2a_invoke");
-        if (!invoke) throw new Error("Outbound invoke tool was not installed");
-        for (const target of ["one", "two", "one-alias", "one"]) {
-          const result = await invoke.execute(`call-${target}-${outputs.length}`, { target, message: "peer call" });
-          const text = result.content[0]?.text;
-          if (typeof text !== "string") throw new Error("Peer tool returned no text");
-          toolErrors.push(result.isError === true);
-          outputs.push(text);
-        }
-      },
-      async abort() {},
-      async *stream() { yield { type: "result", success: true, result: "done", durationMs: 1, conversationId: "outer-conversation" }; },
-      async [Symbol.asyncDispose]() {},
-    }),
-    async close() {},
-  } as unknown as LettaAgentClient;
-  const outerConfig = parseApplicationConfig({ agentId: "outer-agent", backend: { type: "local" }, publicUrl: "http://127.0.0.1:0", port: 0,
-    peers: {
-      one: { url: oneUrl, auth: { tokenEnv: "ONE_OUT", owner: "shared-peer-owner" } },
-      two: { url: twoUrl, auth: { tokenEnv: "TWO_OUT", owner: "shared-peer-owner" } },
-      "one-alias": { url: oneUrl, auth: { tokenEnv: "ONE_OUT", owner: "shared-peer-owner" } },
-    },
-  });
-  const outerScope = await Effect.runPromise(Scope.make());
-  try {
-    const app = await Effect.runPromise(startApplicationServer(outerConfig, () => outerClient, "127.0.0.1", {
-      ONE_OUT: "peer-one-bearer", TWO_OUT: "peer-two-bearer",
-    }).pipe(Effect.provideService(Scope.Scope, outerScope)));
-    const remote = createA2AClient({ routes: { agent: app.bindings.default! }, pollIntervalMs: 5 });
-    try {
-      await remote.invoke({ target: "agent", message: "run peer tools", localScope: "caller", signal: AbortSignal.timeout(5000) });
-      expect(toolErrors).toEqual([false, false, false, false]);
-      const contextIds = outputs.map((text) => (JSON.parse(text) as { contextId?: string }).contextId);
-      expect(contextIds[0]).toBeTruthy();
-      expect(contextIds[1]).toBeTruthy();
-      expect(contextIds[0]).not.toBe(contextIds[1]);
-      expect(contextIds[2]).toBe(contextIds[0]);
-      expect(contextIds[3]).toBe(contextIds[0]);
-      const oneRequests = peerRequests.filter((request) => new URL(request.url).pathname.startsWith("/peer/one"));
-      const twoRequests = peerRequests.filter((request) => new URL(request.url).pathname.startsWith("/peer/two"));
-      expect(oneRequests.length).toBeGreaterThan(0);
-      expect(twoRequests.length).toBeGreaterThan(0);
-      expect(oneRequests.every((request) => request.authorization === "Bearer peer-one-bearer")).toBe(true);
-      expect(twoRequests.every((request) => request.authorization === "Bearer peer-two-bearer")).toBe(true);
-    } finally { remote.close(); }
-  } finally {
-    globalThis.fetch = originalFetch;
-    await Effect.runPromise(Scope.close(outerScope, Exit.void));
-    await Effect.runPromise(Scope.close(peerScope, Exit.void));
-  }
-}, 15000);
-
-function peerClient() {
-  const open = () => ({
-    async ready() { return { conversationId: "same-peer-conversation" }; },
-    async send() {}, async abort() {},
-    async *stream() { yield { type: "result", success: true, result: "peer answer", durationMs: 1, conversationId: "same-peer-conversation" }; },
-    async [Symbol.asyncDispose]() {},
-  });
-  return {
-    agents: { retrieve: async (id: string) => ({ id }) },
-    createSession: open, resumeSession: open, async close() {},
-  } as unknown as LettaAgentClient;
-}
 
 test("launcher ownership closes its client when startup fails", async () => {
   let closed = false;
@@ -688,13 +568,12 @@ for (const incomplete of [false, true]) {
       agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0",
     }), owned);
     }).pipe(Effect.provideService(Scope.Scope, scope)));
-    const remote = createA2AClient({ routes: { test: server.url } });
+    const remote = await testClient(server.url);
     try {
-      const call = remote.invoke({ target: "test", message: "hello", localScope: "owner", signal: AbortSignal.timeout(10000) });
+      const call = remote.sendMessage(sendRequest("hello"));
       if (incomplete) await call.catch(() => undefined);
       else await call;
     } finally {
-      remote.close();
       const exit = await Effect.runPromiseExit(Scope.close(scope, Exit.void));
       expect(Exit.isFailure(exit)).toBe(incomplete);
     }

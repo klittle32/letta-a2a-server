@@ -5,9 +5,7 @@ import type { AddressInfo } from "node:net";
 import { Context, Effect, Layer, Schema } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AgentSdkTurnRunner, DurableBinding, createBridge, createBridgeRouter } from "./bridge/index.js";
-import { createA2AClient, FileContextStore } from "./client/index.js";
-import { createA2ATools } from "./client/agent-sdk.js";
-import { PeerConfigurationValidationError, validatePeerAliases, type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
+import { type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
 
 export class ServerStartupError extends Schema.TaggedError<ServerStartupError>()("ServerStartupError", {
   message: Schema.String,
@@ -27,7 +25,7 @@ export function withTurnDeadline(runner: AgentSdkTurnRunner, timeoutMs = 120_000
   };
 }
 
-class PeerConfigurationError extends Schema.TaggedError<PeerConfigurationError>()("PeerConfigurationError", {
+class InboundAuthenticationConfigurationError extends Schema.TaggedError<InboundAuthenticationConfigurationError>()("InboundAuthenticationConfigurationError", {
   message: Schema.String,
 }) {}
 
@@ -40,7 +38,7 @@ type BearerBridgeOptions = Pick<import("./bridge/bridge.js").BridgeOptions, "aut
 function makeBearerBridgeOptions(binding: ApplicationBindingConfig, env: NodeJS.ProcessEnv): Partial<BearerBridgeOptions> {
   if (!binding.auth) return {};
   const token = env[binding.auth.tokenEnv];
-  if (!token?.trim()) throw new PeerConfigurationError({ message: `Required environment variable ${binding.auth.tokenEnv} is missing` });
+  if (!token?.trim()) throw new InboundAuthenticationConfigurationError({ message: "Required inbound authentication environment variable is missing" });
   const owner = binding.auth.owner;
   const gate: import("express").RequestHandler = (req, res, next) => {
     const values = req.headers.authorization;
@@ -69,11 +67,6 @@ function constantTimeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left); const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
 }
-
-const typedPeerValidation = (peers: Parameters<typeof validatePeerAliases>[0], env: NodeJS.ProcessEnv) =>
-  Effect.try({ try: () => validatePeerAliases(peers, env), catch: (error) => error instanceof PeerConfigurationValidationError
-    ? new PeerConfigurationError({ message: error.message })
-    : new PeerConfigurationError({ message: "Peer configuration is invalid or incomplete" }) });
 
 // Imported promises do not establish backend cancellation. Finalizers await the
 // actual public disposal promises, uninterruptibly, and never retry sent work.
@@ -120,7 +113,7 @@ export const acquireSdkClient = Effect.fn("Server.acquireSdkClient")(
 
 /** Acquires server resources; the supplied SDK client remains caller-owned. */
 const acquireBinding = Effect.fn("Server.acquireBinding")(
-  function* (config: ServerConfig & { id?: string }, client: LettaAgentClient, extra: ReturnType<typeof makeBearerBridgeOptions> = {}, env: NodeJS.ProcessEnv = process.env) {
+  function* (config: ServerConfig & { id?: string }, client: LettaAgentClient, extra: ReturnType<typeof makeBearerBridgeOptions> = {}) {
     // The SDK supplies no cancellation/drain contract here. Pending
     // interruption must await real retrieval (and lazy management startup)
     // before scope finalizers may close the owning client.
@@ -131,8 +124,6 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
     if (agent.id !== config.agentId) {
       return yield* new ServerStartupError({ message: "Configured agent identity could not be verified" });
     }
-    yield* typedPeerValidation(config.peers, env);
-    const peers = Object.fromEntries(Object.entries(config.peers).map(([name, peer]) => [name, typeof peer === "string" ? { url: peer } : peer]));
     const durability = config.stateDirectory
       ? yield* Effect.acquireRelease(
           Effect.tryPromise({
@@ -142,39 +133,6 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
           (resource) => shutdown("Durable state shutdown failed", () => resource.close()),
         )
       : undefined;
-    const outbound = yield* Effect.acquireRelease(
-      Effect.try({
-        try: () => {
-          if (!Object.keys(config.peers).length) return undefined;
-          const routes = Object.fromEntries(Object.entries(peers).map(([alias, peer]) => [alias, peer.url]));
-          const policyCache = new Map<string, NonNullable<Parameters<typeof createA2AClient>[0]["routePolicies"]>[string]>();
-          const routePolicies = Object.fromEntries(Object.entries(peers).flatMap(([alias, peer]) => {
-            if (!peer.auth) return [];
-            const auth = peer.auth;
-            const token = env[auth.tokenEnv]!;
-            const endpoint = new URL(peer.url).href;
-            const signature = JSON.stringify([endpoint, peer.auth.owner, peer.auth.tokenEnv]);
-            const existing = policyCache.get(signature);
-            if (existing) return [[alias, existing]];
-            const origin = new URL(peer.url).origin;
-            const policy = {
-              destinationOrigins: [origin], peerIdentity: `peer:${endpoint}`,
-              credential: {
-                owner: auth.owner, audience: endpoint, origins: [origin], headerNames: ["authorization"],
-                provide: async () => ({ owner: auth.owner, audience: endpoint,
-                  headers: { authorization: `Bearer ${token}` } }),
-              },
-            };
-            policyCache.set(signature, policy);
-            return [[alias, policy]];
-          }));
-          return createA2AClient({ routes, routePolicies,
-            ...(config.stateDirectory ? { contextStore: new FileContextStore(`${config.stateDirectory}/outbound-context.json`) } : {}) });
-        },
-        catch: () => new ServerStartupError({ message: "Outbound client construction failed" }),
-      }),
-      (resource) => shutdown("Outbound client shutdown failed", () => resource?.close()),
-    );
     const backendIdentity = JSON.stringify([
       config.backend.type,
       config.backend.type === "remote" ? config.backend.url :
@@ -187,16 +145,11 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
     const runner = new AgentSdkTurnRunner(client, config.agentId, {
       sharingDomain: config.id ?? config.agentId,
       ...(durability ? { conversationMapping: durability.conversationMapping, execution: durability.execution } : {}),
-      sessionOptions(scope) {
-        const tools = outbound ? createA2ATools({ client: outbound,
-          getScope: () => ({ agentId: scope.agentId, conversationId: scope.conversationId ?? null }), signal: scope.signal,
-        }) : undefined;
-        const names = new Set(tools?.tools.map((tool) => tool.name));
+      sessionOptions() {
         return { options: { ...(config.cwd ? { cwd: config.cwd } : {}), permissionMode: "standard",
-          ...(tools ? { tools: tools.tools } : {}),
-          canUseTool: async (name) => names.has(name) ? { behavior: "allow" } :
-            { behavior: "deny", message: "This server has no interactive approval UI", interrupt: false },
-        }, close: () => tools?.close() };
+          canUseTool: async () =>
+            ({ behavior: "deny", message: "This server has no interactive approval UI", interrupt: false }),
+        } };
       },
     });
     const bridge = yield* Effect.acquireRelease(
@@ -256,16 +209,15 @@ export const startApplicationServer = Effect.fn("Server.startApplicationServer")
   function* (config: ApplicationConfig, createClient: (binding: ApplicationBindingConfig) => LettaAgentClient, host = "127.0.0.1", env: NodeJS.ProcessEnv = process.env) {
     const app = express(); app.disable("x-powered-by");
     app.get("/healthz", (_request, response) => response.json({ status: "ok" }));
-    for (const binding of config.bindings) yield* typedPeerValidation(binding.peers, env);
     const bridges: Array<{ binding: ApplicationBindingConfig; bridge: ReturnType<typeof createBridge> }> = [];
     for (const binding of config.bindings) {
       const client = yield* acquireSdkClient(() => createClient(binding));
       const serverConfig: ServerConfig & { id: string } = { id: binding.id, agentId: binding.agentId, name: binding.name, backend: binding.backend, port: config.port,
-        publicUrl: binding.publicUrl, peers: binding.peers,
+        publicUrl: binding.publicUrl,
         ...(binding.stateDirectory ? { stateDirectory: binding.stateDirectory } : {}), ...(binding.cwd ? { cwd: binding.cwd } : {}) };
       const extra = yield* Effect.try({ try: () => makeBearerBridgeOptions(binding, env),
-        catch: () => new PeerConfigurationError({ message: "Inbound authentication configuration is invalid or incomplete" }) });
-      const bridge = (yield* acquireBinding(serverConfig, client, extra, env)).bridge;
+        catch: () => new InboundAuthenticationConfigurationError({ message: "Inbound authentication configuration is invalid or incomplete" }) });
+      const bridge = (yield* acquireBinding(serverConfig, client, extra)).bridge;
       bridges.push({ binding, bridge });
       const externalPrefix = new URL(config.publicUrl).pathname.replace(/\/$/, "");
       const mountPath = `${externalPrefix}${binding.path}` || "";

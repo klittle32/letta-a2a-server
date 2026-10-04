@@ -3,6 +3,5 @@
   "name": "Cloud-backed Letta Agent",
   "backend": { "type": "local", "harnessBackend": "api" },
   "publicUrl": "http://127.0.0.1:41241/",
-  "port": 41241,
-  "peers": {}
+  "port": 41241
 }

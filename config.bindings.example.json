@@ -9,15 +9,13 @@
       "path": "/first",
       "connection": "local",
       "agentId": "agent-local-replace-with-an-existing-first-agent",
-      "name": "First agent",
-      "peers": {}
+      "name": "First agent"
     },
     "second": {
       "path": "/second",
       "connection": "local",
       "agentId": "agent-local-replace-with-an-existing-second-agent",
-      "name": "Second agent",
-      "peers": {}
+      "name": "Second agent"
     }
   }
 }
