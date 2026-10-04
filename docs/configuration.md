@@ -14,6 +14,8 @@ The default `docker compose up -d` starts only `server`. To use local state inst
 
 **Host execution:** `node dist/main.js ./my-config.json` takes a positional config path, defaulting to `config.local.json`. Named credential variables must be available in the process environment; the server does not automatically load `.env`. Set `publicUrl` to the host listener's actual URL rather than keeping a Docker port mapping.
 
+`A2A_LISTEN_HOST` controls the HTTP bind address: the default is `127.0.0.1`; the only other accepted value is `0.0.0.0`. Compose selects `0.0.0.0` inside the container and publishes only on host loopback. `publicUrl` changes the advertised address and route prefix, not the bind address, port, or TLS configuration.
+
 ## Single-agent configuration
 
 ```json
@@ -28,7 +30,7 @@ The default `docker compose up -d` starts only `server`. To use local state inst
 
 `agentId` must identify an existing agent. `name` defaults to `Letta A2A Agent`; `port` defaults to `41241`; `publicUrl` defaults to `http://127.0.0.1:41241/`. `cwd` is an optional runtime working directory. `stateDirectory` enables durable A2A state.
 
-For an authenticated single agent, use the application form with one entry in `bindings`; the single-agent object has no inbound `auth` field.
+This shorthand accepts only an anonymous `http://127.0.0.1:<port>/` public URL, with no path prefix. For authentication, HTTPS, a different hostname, or a path prefix, use the application form with one entry in `bindings`; the single-agent object has no inbound `auth` field. Changing `port` does not automatically update `publicUrl`.
 
 ## Runtime backends
 
@@ -55,7 +57,11 @@ The application form has shared listener settings, named backend `connections`, 
 
 Each binding owns SDK client/session resources and task/conversation mappings. Reusing a message or context ID on another binding does not select the first binding's conversation; task lookup and cancellation do not cross routes. `connections` reuses backend settings, not application clients. Two bindings that reference the same Letta agent still share that agent's memory.
 
-Routes must be unique and non-overlapping. Reserved paths include `/healthz`, `/.well-known/agent-card.json`, and `/rpc`. A root binding cannot be combined with other bindings. The path is mounted in full; a reverse proxy must preserve its prefix.
+Routes must be unique and non-overlapping, with collision checks ignoring case. A binding's `path` is either `""` for the application root or a path such as `"/support"` with a leading slash and no trailing slash. `"/"` is not a valid binding path. Reserved paths include `/healthz`, `/.well-known/agent-card.json`, and `/rpc`. A root binding cannot be combined with other bindings. The path is mounted in full; a reverse proxy must preserve its prefix.
+
+Each binding serves JSON-RPC/SSE at its advertised base URL and its Agent Card at `.well-known/agent-card.json` beneath that base; clients do not need to append `/rpc`. There is no aggregate agent registry or discovery index.
+
+`GET /healthz` stays at the listener root, outside any configured prefix or binding authentication. It reports listener health, not a fresh backend/model readiness check.
 
 ## Advertised URLs and reachability
 
@@ -63,7 +69,7 @@ Routes must be unique and non-overlapping. Reserved paths include `/healthz`, `/
 
 The **advertised `publicUrl` must be reachable by intended clients**; it need not be reachable from inside the container. For example, the host CLI reaches the Compose local service at `http://127.0.0.1:41242/`, while the container listens on port `41241`.
 
-Docker loopback port publishing is a development exposure choice, not a trusted-network security guarantee. For externally reachable endpoints, use HTTPS and a TLS terminating proxy. Anonymous application bindings are limited to loopback URLs. Bearer-protected non-loopback public URLs require HTTPS in configuration.
+Docker loopback port publishing is a development exposure choice, not a trusted-network security guarantee. For externally reachable endpoints, use HTTPS and a TLS terminating proxy; the server itself serves HTTP. Anonymous application bindings require an HTTP URL with hostname `127.0.0.1`, `localhost`, or `[::1]`. Other application URLs require bearer authentication and HTTPS in configuration, including HTTPS loopback URLs.
 
 ## Inbound authentication
 
@@ -75,25 +81,23 @@ Add an auth object to a binding:
 
 Pass `A2A_FIRST_TOKEN` into the server container explicitly. Clients send `Authorization: Bearer …`; protected Agent Card discovery and RPC/SSE calls both require it. `owner` is a stable identity across token rotation, not the token. A shared token is a single trust domain, not per-user authorization.
 
+The server does not manage users, issue tokens, or implement OAuth/RBAC. A gateway forwarding one binding token does not give its individual users separate identities inside this server. Keep those policies in the external gateway and use distinct agents where memory isolation is required.
+
 Inbound A2A credentials are not reused as Letta/App Server credentials. Credential separation at the request layer is not an SDK child-process environment sandbox. Do not place secret values in configuration files; configuration stores environment variable names.
-
-## Removing obsolete peer settings
-
-Remove the `peers` field from existing single-agent or binding configuration before starting the updated server, **even if it is `{}`**. Application-level `peers` is also rejected. Startup reports a fixed removal instruction without exposing supplied values. No peer routes or credential references are loaded.
-
-Outbound-only credential references are no longer consumed; remove unnecessary environment entries from your own deployment configuration. Keep inbound bearer and Letta/App Server credentials. The server does not delete credentials or existing `outbound-context.json` files and does not reset inbound durable databases.
-
-The server no longer injects `a2a_invoke` or `a2a_task`. Calling other agents is outside its responsibilities; use the agent's independently configured tools if needed. It does not install or replace those tools. Interactive approval requests remain denied; native tools remain subject to the selected runtime's normal permissions.
 
 ## Execution behavior
 
-The server exposes text-only A2A 1.0 JSON-RPC/SSE. A turn has a two-minute execution deadline in both in-memory and durable profiles. Deadline expiry requests interruption; it does not certify that the backend stopped. Streaming emits safe activity updates followed by one complete answer artifact. Input/auth-required questions remain status messages; failed or canceled turns do not publish an answer.
+The server exposes text-only A2A 1.0 JSON-RPC/SSE. It uses the agent's independently configured tools and the selected runtime's normal permissions. Interactive approval requests are denied because the server has no approval UI; it does not bypass permission checks or install tools.
+
+A fixed two-minute abort deadline starts when a turn enters the runner, including time waiting for another turn in the same context. This applies to both in-memory and durable profiles. Expiry requests interruption, not a hard HTTP response cutoff or proof that the backend stopped; readiness and cleanup may take longer. Streaming emits safe activity updates followed by one complete answer artifact. Input/auth-required questions remain status messages; failed or canceled turns do not publish an answer.
 
 ## Durable state
 
 Set `stateDirectory` to a persistent path to retain A2A tasks, Letta conversation mappings, and recovery records. In a single-agent config it names that binding's directory. In multi-binding config, the application-level root receives one subdirectory per binding ID; a binding-level value names that binding's exact directory.
 
-Directories must not overlap, and one process must own each binding directory. The default Compose services mount `/home/node/.letta` on separate persistent volumes. An ordinary container-layer path will not survive container replacement.
+Directories must not overlap, and one process must own each binding directory. The default Compose services mount `/home/node/.letta` on separate persistent volumes. An ordinary container-layer path will not survive container replacement. Relative state paths resolve from the server process's working directory, not the JSON file's directory.
+
+**The checked-in examples omit `stateDirectory`, so their A2A task/context mappings are in memory.** Persistent Letta runtime volumes alone do not enable durable A2A state. For example, add `"stateDirectory": "/home/node/.letta/a2a-state"` to a Compose configuration to put A2A state in that service's existing volume.
 
 Durability is local, single-owner recovery, not distributed failover or exactly-once tool execution. Restart does not replay sent work. Unresolved execution is retained for investigation and is not declared canceled. Identity guards compare configured agent/backend selectors and credential reference names; they do not independently verify the actual backend account, principal, or machine. Never repoint state at an unrelated backend.
 
