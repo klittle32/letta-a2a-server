@@ -68,10 +68,10 @@ test("normal CLI program loads multi-binding config and retrieves each configure
   }
 });
 
-test("normal CLI program retains the legacy single-agent config path", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "letta-a2a-legacy-"));
-  const configPath = join(directory, "legacy.json");
-  await writeFile(configPath, JSON.stringify({ agentId: "legacy-agent", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" }));
+test("normal CLI program loads single-agent configuration", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "letta-a2a-single-agent-"));
+  const configPath = join(directory, "single-agent.json");
+  await writeFile(configPath, JSON.stringify({ agentId: "single-agent", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" }));
   const retrieved: string[] = [];
   const createClient = () => ({ agents: { async retrieve(id: string) { retrieved.push(id); return { id }; } }, async close() {} }) as unknown as LettaAgentClient;
   const scope = await Effect.runPromise(Scope.make());
@@ -81,7 +81,7 @@ test("normal CLI program retains the legacy single-agent config path", async () 
   try {
     for (let tries = 0; tries < 100 && retrieved.length < 1; tries++)
       await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(retrieved).toEqual(["legacy-agent"]);
+    expect(retrieved).toEqual(["single-agent"]);
   } finally {
     controller.abort();
     await running.catch(() => undefined);

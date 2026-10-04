@@ -19,7 +19,7 @@ export interface LettaTurnRequest {
   messageId: string;
   text: string;
   signal: AbortSignal;
-  /** Legacy provisional-text observer; the executor never publishes its content. */
+  /** Provisional-text observer; the executor never publishes its content. */
   onAssistantText(text: string): void;
   /** Accepts only safe public activity labels, never reasoning or raw tool/error content. */
   onActivity?(activity: string): void;

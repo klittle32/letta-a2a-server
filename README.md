@@ -1,6 +1,6 @@
 # Letta A2A Server
 
-Expose existing Letta agents through the [A2A](https://a2a-protocol.org/) protocol. The server accepts A2A requests, runs the selected agent with the Letta Agent SDK, and can give that session tools for calling configured A2A peers. It supports a legacy single-agent configuration and multiple fixed agent bindings on one listener.
+Expose existing Letta agents through the [A2A](https://a2a-protocol.org/) protocol. The server accepts A2A requests, runs the selected agent with the Letta Agent SDK, and can give that session tools for calling configured A2A peers. Configure one agent directly or use named bindings for one or more agents on a shared listener.
 
 The application uses Effect 4 for configuration, resource ownership, and process lifecycle. The A2A and Letta SDKs handle protocol and agent execution. This is an early standalone server; it is not a multi-tenant security boundary or a claim of complete runtime parity. Package publication and installation from a registry remain pending.
 

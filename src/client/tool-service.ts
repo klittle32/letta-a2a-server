@@ -173,12 +173,12 @@ export class A2AToolService {
         const binding = await this.load(key);
         this.requireReadback(binding);
         if (!binding.contextId && !explicitContext && !input.newContext) {
-          const legacy = await this.contexts.get(
+          const storedContext = await this.contexts.get(
             `${input.localScope}/${input.target}`,
           );
-          if (legacy)
+          if (storedContext)
             throw new A2AInvocationError(
-              `Legacy A2A context ${JSON.stringify(legacy)} has no endpoint identity. Supply context_id explicitly to migrate it, or new_context to start independently; the legacy entry is preserved.`,
+              `Stored A2A context ${JSON.stringify(storedContext)} has no endpoint identity. Supply context_id explicitly to associate it with this endpoint, or new_context to start independently; the stored entry is preserved.`,
             );
         }
         let contextId =

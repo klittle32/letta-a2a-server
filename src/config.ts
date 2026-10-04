@@ -213,10 +213,10 @@ export function parseApplicationConfig(value: unknown): ApplicationConfig {
       });
       return { port: decoded.port, publicUrl: decoded.publicUrl, bindings };
     }
-    const legacy = decodeConfig(serverConfigSchema, value);
-    return { port: legacy.port, publicUrl: legacy.publicUrl, bindings: [normalizeBinding("default", "", legacy.publicUrl,
-      legacy.agentId, legacy.name, legacy.backend, legacy.port, legacy.peers,
-      { ...(legacy.cwd ? { cwd: legacy.cwd } : {}), ...(legacy.stateDirectory ? { stateDirectory: legacy.stateDirectory } : {}) })] };
+    const singleAgent = decodeConfig(serverConfigSchema, value);
+    return { port: singleAgent.port, publicUrl: singleAgent.publicUrl, bindings: [normalizeBinding("default", "", singleAgent.publicUrl,
+      singleAgent.agentId, singleAgent.name, singleAgent.backend, singleAgent.port, singleAgent.peers,
+      { ...(singleAgent.cwd ? { cwd: singleAgent.cwd } : {}), ...(singleAgent.stateDirectory ? { stateDirectory: singleAgent.stateDirectory } : {}) })] };
   } catch (error) {
     if (error instanceof ConfigurationError) throw error;
     throw new ConfigurationError({ message: "Invalid server configuration" });

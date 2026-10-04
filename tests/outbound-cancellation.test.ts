@@ -55,6 +55,20 @@ async function withTempRoot<T>(prefix: string, work: (root: string) => Promise<T
   finally { await rm(root, { recursive: true, force: true }); }
 }
 
+test("stored context without endpoint identity has an actionable diagnostic and is preserved", async () => {
+  const store = new MemoryContextStore();
+  await store.set(`${scope}/peer`, "stored-context");
+  const calls = { value: 0 };
+  const service = new A2AToolService({ peer: url }, invoker(async () => result, calls), store);
+  try {
+    await expect(service.invoke(request(new AbortController().signal))).rejects.toThrow(
+      'Stored A2A context "stored-context" has no endpoint identity. Supply context_id explicitly to associate it with this endpoint, or new_context to start independently; the stored entry is preserved.',
+    );
+    expect(calls.value).toBe(0);
+    expect(await store.get(`${scope}/peer`)).toBe("stored-context");
+  } finally { service.close(); }
+});
+
 test("cancellation during first binding journal save restores durable state and queues later work", async () => withTempRoot("a2a-outbound-cancel-", async (root) => {
   const entered = deferred<string>();
   const release = deferred();

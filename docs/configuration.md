@@ -1,6 +1,6 @@
 # Configuration reference
 
-The server accepts either the legacy single-agent object or the multi-binding application object. JSON is strict: unknown properties and invalid routes are rejected at startup. Copy an example to an ignored local file, supply existing agent IDs, and keep secret values in the environment—not JSON.
+The server accepts a single-agent object or a bindings-based application object for one or more agents. Both are current configuration options. JSON is strict: unknown properties and invalid routes are rejected at startup. Copy an example to an ignored local file, supply existing agent IDs, and keep secret values in the environment—not JSON.
 
 | Example | Copy to | Compose use |
 | --- | --- | --- |
@@ -12,7 +12,7 @@ The server accepts either the legacy single-agent object or the multi-binding ap
 
 **Host execution:** `node dist/main.js ./my-config.json` takes a positional config path, defaulting to `config.local.json`. Named credential variables must be available in the process environment; the server does not automatically load `.env`. Set `publicUrl` to the host listener's actual URL rather than keeping a Docker port mapping.
 
-## Legacy single-agent form
+## Single-agent configuration
 
 ```json
 {
@@ -27,7 +27,7 @@ The server accepts either the legacy single-agent object or the multi-binding ap
 
 `agentId` must identify an existing agent. `name` defaults to `Letta A2A Agent`; `port` defaults to `41241`; `publicUrl` defaults to `http://127.0.0.1:41241/`. `cwd` is an optional runtime working directory. `stateDirectory` enables durable A2A state. `peers` defaults to empty.
 
-For an authenticated single agent, use the application form with one entry in `bindings`; the legacy object has no inbound `auth` field.
+For an authenticated single agent, use the application form with one entry in `bindings`; the single-agent object has no inbound `auth` field.
 
 ## Runtime backends
 
@@ -48,7 +48,7 @@ For Cloud connections, `apiKeyEnv` names a credential variable; omitting it leav
 
 `cwd` belongs to the execution environment: the local SDK host/container, remote App Server host, Cloud sandbox, or selected connected computer. It does not transfer or mount local files. Session-owned A2A peer tools still execute in this server's SDK process, regardless of the agent's execution target. See the [SDK deployment reference](https://docs.letta.com/agent-sdk/deployment/index.md) for the underlying modes.
 
-## Several fixed agents on one listener
+## Named agent bindings
 
 The application form has shared listener settings, named backend `connections`, and a `bindings` record. Each binding defines a route, existing agent, display name, optional working directory, peers, auth, and state directory. See `config.bindings.example.json` for a complete example. Its top-level `publicUrl` is `http://127.0.0.1:41242/agents/`, with `/first` and `/second` binding paths.
 
@@ -105,7 +105,7 @@ Directories must not overlap, and one process must own each binding directory. T
 
 Durability is local, single-owner recovery, not distributed failover or exactly-once tool execution. Restart does not replay sent work. Unresolved execution is retained for investigation and is not declared canceled. Identity guards compare configured agent/backend selectors and credential reference names; they do not independently verify the actual backend account, principal, or machine. Never repoint state at an unrelated backend.
 
-Automatic recovery publishes an answer only when the filtered final text was recorded after successful execution and owned cleanup. Provisional assistant observations and unfiltered result text are not recovery answers, including observations left by older versions. Already-published valid results remain recoverable.
+Automatic recovery publishes an answer only when the filtered final text was recorded after successful execution and owned cleanup. Provisional assistant observations and unfiltered result text are never recovery answers. Already-published valid results remain recoverable.
 
 An outbound call canceled before submission restores its previous context records once pending journal writes settle. Its caller may receive cancellation before that restoration finishes; the operation retains its locks until persistence settles. This does not relax quarantine for an attempted or ambiguous send, and `new_context` is not a way to discard uncertain work.
 

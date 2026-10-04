@@ -101,7 +101,7 @@ Current registry observations, not verified compatibility: SDK `0.8.28`, Code `0
 
 **Delivered:** one process/port serves multiple fixed configured agents. The configuration and operational details are in [Configuration reference](docs/configuration.md).
 
-Legacy and multi-binding configuration, optional inbound bearer authentication,
+Single-agent and multi-binding configuration, optional inbound bearer authentication,
 mounted card discovery, startup validation, and binding-owned resources are
 implemented. The earlier local two-agent trial and its limits are summarized in
 [Development and support](docs/development.md). The deleted Phase 3 worktree and
@@ -151,7 +151,7 @@ disconnect, and successful turns do not prove remote stop.
 
 - Agent orchestration, schedulers, routing services, discovery directories, or dynamic tenants.
 - A custom model-provider layer, inference gateway, OAuth issuer, or generic plugin system.
-- New REST/gRPC bindings, legacy-protocol expansion, or rich media execution beyond the retained supported A2A profile.
+- New REST/gRPC bindings, protocol versions other than A2A 1.0, or rich media execution beyond the supported text-only profile.
 - Distributed persistence, automatic crash replay, high availability, or a new recovery subsystem.
 - Installing outbound A2A capabilities globally into unrelated Letta sessions.
 - Making agentgateway or LiteLLM work as part of the server's release gate.

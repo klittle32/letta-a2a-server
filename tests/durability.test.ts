@@ -34,18 +34,18 @@ test("state directories are assigned per binding and identity cannot cross backe
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("upgrading an existing durable profile preserves its original agent identity guard", async () => {
-  const root = await mkdtemp(join(tmpdir(), "a2a-durable-legacy-"));
+test("an agent-ID-only durable record preserves its identity when binding a backend", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-agent-id-"));
   let binding: DurableBinding | undefined;
   try {
-    const legacy = await SqliteBindingStore.open({ directory: root, bindingId: "legacy" });
-    legacy.setRecord("meta", "agentId", "original-agent");
-    legacy.close();
-    binding = await DurableBinding.open({ directory: root, bindingId: "legacy" });
+    const stored = await SqliteBindingStore.open({ directory: root, bindingId: "agent-id-only" });
+    stored.setRecord("meta", "agentId", "original-agent");
+    stored.close();
+    binding = await DurableBinding.open({ directory: root, bindingId: "agent-id-only" });
     expect(() => binding!.bindAgent("different-agent", "local")).toThrow("identity mismatch");
     binding.bindAgent("original-agent", "local");
     await binding.close();
-    binding = await DurableBinding.open({ directory: root, bindingId: "legacy" });
+    binding = await DurableBinding.open({ directory: root, bindingId: "agent-id-only" });
     expect(() => binding!.bindAgent("original-agent", "remote")).toThrow("identity mismatch");
   } finally {
     await binding?.close();
@@ -527,26 +527,26 @@ test("cancellation after stop prevents completed answer recovery", async () => {
   }
 });
 
-test("legacy stopped observations stay private while saved publication survives recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "a2a-durable-legacy-publication-"));
+test("stored provisional observations stay private while saved publication survives recovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-stored-publication-"));
   try {
-    const binding = await DurableBinding.open({ directory: root, bindingId: "legacy-publication-binding" });
-    binding.bindAgent("legacy-publication-agent", "local");
+    const binding = await DurableBinding.open({ directory: root, bindingId: "stored-publication-binding" });
+    binding.bindAgent("stored-publication-agent", "local");
     const context = new ServerCallContext();
-    const message = Message.fromJSON({ messageId: "legacy-publication-message", role: "user", parts: [{ text: "hello" }] });
-    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "legacy-publication-task", "legacy-publication-context", context);
+    const message = Message.fromJSON({ messageId: "stored-publication-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "stored-publication-task", "stored-publication-context", context);
     const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
-    await binding.accept(request, initial, "legacy-publication-artifact");
+    await binding.accept(request, initial, "stored-publication-artifact");
     await binding.close();
-    const store = await SqliteBindingStore.open({ directory: root, bindingId: "legacy-publication-binding" });
+    const store = await SqliteBindingStore.open({ directory: root, bindingId: "stored-publication-binding" });
     const [key, record] = store.records<Record<string, unknown>>("executions")[0]!;
-    Object.assign(record, { phase: "publishing", stopped: true, publicChunks: ["PRIVATE legacy delta"], resultText: "PRIVATE legacy result", publication: true });
+    Object.assign(record, { phase: "publishing", stopped: true, publicChunks: ["PRIVATE provisional delta"], resultText: "PRIVATE unfiltered result", publication: true });
     store.setRecord("executions", key, record);
     store.setRecord("publications", key, Task.toJSON(Task.fromJSON({ id: request.taskId, contextId: request.contextId,
       status: { state: TaskState.TASK_STATE_COMPLETED }, artifacts: [{ artifactId: "saved-answer", parts: [{ text: "Legitimately published answer" }] }], history: [message] })));
     store.close();
 
-    const reopened = await DurableBinding.open({ directory: root, bindingId: "legacy-publication-binding" });
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "stored-publication-binding" });
     const recovered = await reopened.taskStore.load(request.taskId, context);
     expect(JSON.stringify(recovered)).toContain("Legitimately published answer");
     expect(JSON.stringify(recovered)).not.toContain("PRIVATE");
@@ -556,25 +556,25 @@ test("legacy stopped observations stay private while saved publication survives 
   }
 });
 
-test("legacy stopped observations without a saved publication stay private", async () => {
-  const root = await mkdtemp(join(tmpdir(), "a2a-durable-legacy-stopped-"));
+test("stored stopped observations without a saved publication stay private", async () => {
+  const root = await mkdtemp(join(tmpdir(), "a2a-durable-stored-stopped-"));
   try {
-    const binding = await DurableBinding.open({ directory: root, bindingId: "legacy-stopped-binding" });
-    binding.bindAgent("legacy-stopped-agent", "local");
+    const binding = await DurableBinding.open({ directory: root, bindingId: "stored-stopped-binding" });
+    binding.bindAgent("stored-stopped-agent", "local");
     const context = new ServerCallContext();
-    const message = Message.fromJSON({ messageId: "legacy-stopped-message", role: "user", parts: [{ text: "hello" }] });
-    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "legacy-stopped-task", "legacy-stopped-context", context);
+    const message = Message.fromJSON({ messageId: "stored-stopped-message", role: "user", parts: [{ text: "hello" }] });
+    const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "stored-stopped-task", "stored-stopped-context", context);
     const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
-    await binding.accept(request, initial, "legacy-stopped-artifact");
+    await binding.accept(request, initial, "stored-stopped-artifact");
     await binding.close();
 
-    const store = await SqliteBindingStore.open({ directory: root, bindingId: "legacy-stopped-binding" });
+    const store = await SqliteBindingStore.open({ directory: root, bindingId: "stored-stopped-binding" });
     const [key, record] = store.records<Record<string, unknown>>("executions")[0]!;
-    Object.assign(record, { phase: "stopped", stopped: true, publicChunks: ["PRIVATE old delta"], resultText: "PRIVATE old result" });
+    Object.assign(record, { phase: "stopped", stopped: true, publicChunks: ["PRIVATE provisional delta"], resultText: "PRIVATE unfiltered result" });
     store.setRecord("executions", key, record);
     store.close();
 
-    const reopened = await DurableBinding.open({ directory: root, bindingId: "legacy-stopped-binding" });
+    const reopened = await DurableBinding.open({ directory: root, bindingId: "stored-stopped-binding" });
     const recovered = await reopened.taskStore.load(request.taskId, context);
     expect(recovered?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED);
     expect(recovered?.artifacts ?? []).toHaveLength(0);

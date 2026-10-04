@@ -289,9 +289,9 @@ export class DurableBinding {
   bindAgent(agentId: string, backendIdentity = "unspecified"): void {
     const identity = JSON.stringify([agentId, backendIdentity]);
     const old = this.storage.getRecord<string>("meta", "agentIdentity");
-    const legacyAgentId = this.storage.getRecord<string>("meta", "agentId");
+    const storedAgentId = this.storage.getRecord<string>("meta", "agentId");
     if (!agentId || !backendIdentity || (old && old !== identity) ||
-        (legacyAgentId && legacyAgentId !== agentId))
+        (storedAgentId && storedAgentId !== agentId))
       throw new Error("Durable agent or backend identity mismatch");
     this.storage.setRecord("meta", "agentIdentity", identity);
   }
@@ -691,7 +691,7 @@ export class DurableBinding {
     detail: string,
     text?: string,
   ): AgentExecutionEvent[] {
-    // Legacy publicChunks/resultText are provisional observation records and
+    // Stored publicChunks/resultText are provisional observation records and
     // must never be promoted during recovery. Only a post-cleanup selection is
     // eligible; operator-supplied text remains separately explicit.
     const selected =

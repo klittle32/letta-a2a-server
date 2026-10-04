@@ -23,7 +23,7 @@ describe("server configuration", () => {
     expect(config.port).toBe(0);
   });
 
-  test("legacy application config normalizes to one root binding and loads through FileSystem", async () => {
+  test("single-agent config normalizes to one root binding and loads through FileSystem", async () => {
     const normalized = parseApplicationConfig({ ...base, port: 0, publicUrl: "http://127.0.0.1:0" });
     expect(normalized.bindings).toHaveLength(1);
     expect(normalized.bindings[0]?.path).toBe("");
@@ -279,7 +279,7 @@ describe("server configuration", () => {
       .toBe("http://127.0.0.1:4242/");
   });
 
-  test("the first slice stays loopback-only and rejects credential-bearing peer URLs", () => {
+  test("single-agent configuration requires loopback URLs and rejects credential-bearing peer URLs", () => {
     expect(() => parseConfig({ ...base, publicUrl: "https://public.example" })).toThrow();
     expect(() => parseConfig({ ...base, peers: { helper: "https://peer.example?token=secret" } })).toThrow();
   });

@@ -473,7 +473,7 @@ test("one listener mounts independent bindings under a public prefix and protect
   expect(clients.sort()).toEqual(["a", "b"]);
 }, 15000);
 
-test("legacy normalized root binding preserves health, card discovery, and invocation", async () => {
+test("single-agent root binding serves health, card discovery, and invocation", async () => {
   const opened: string[] = [];
   const client = {
     agents: { retrieve: async (id: string) => ({ id }) },
@@ -487,7 +487,7 @@ test("legacy normalized root binding preserves health, card discovery, and invoc
     },
     async close() {},
   } as unknown as LettaAgentClient;
-  const config = parseApplicationConfig({ agentId: "legacy-root", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
+  const config = parseApplicationConfig({ agentId: "single-root", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
   const scope = await Effect.runPromise(Scope.make());
   const server = await Effect.runPromise(startApplicationServer(config, () => client).pipe(Effect.provideService(Scope.Scope, scope)));
   try {
