@@ -12,7 +12,7 @@ The server owns inbound transport, authentication, task/context lifecycle, and t
 
 There is no production outbound A2A client, peer configuration, peer credential handling, outbound context store, or server-injected A2A tool. None is retained behind a flag, moved into another package, or reproduced as a demonstration subsystem. Official SDK clients in tests drive this server's inbound interfaces only.
 
-Letta backend traffic and protected A2A push-notification delivery remain legitimate network activity. Server-only does not mean network-free.
+Letta backend traffic remains required; server-only does not mean network-free. The bridge retains an optional inbound-task push-notification helper, but the CLI does not configure it or advertise that capability. [Issue #4](https://github.com/klittle32/letta-a2a-server/issues/4) tracks whether to expose or remove it. This cleanup does neither.
 
 ## Retained contract
 

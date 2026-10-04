@@ -5,22 +5,14 @@ import type {
   SDKMessage,
 } from "@letta-ai/letta-agent-sdk";
 
-import type { TrustedCaller } from "./request-policy.js";
-
 export interface LettaTurnRequest {
   /** Host task correlation; never an execution ownership key. */
   taskId?: string;
   /** Dedicated owner-scoped conversation key, not the raw wire context ID. */
   a2aContextId: string;
-  /** Trusted host identity; never populated from message metadata. */
-  caller?: TrustedCaller | undefined;
-  /** Original protocol context for host policy/correlation, not ownership. */
-  protocolContextId?: string;
   messageId: string;
   text: string;
   signal: AbortSignal;
-  /** Provisional-text observer; the executor never publishes its content. */
-  onAssistantText(text: string): void;
   /** Accepts only safe public activity labels, never reasoning or raw tool/error content. */
   onActivity?(activity: string): void;
 }
@@ -44,20 +36,6 @@ export class LettaTurnCancelledError extends Error {
     this.name = "LettaTurnCancelledError";
   }
 }
-export interface SessionScope {
-  readonly agentId: string;
-  readonly caller?: TrustedCaller | undefined;
-  readonly a2aContextId: string;
-  readonly protocolContextId?: string | undefined;
-  readonly messageId: string;
-  /** Becomes available after SDK readiness; never supplied by model arguments. */
-  readonly conversationId: string | undefined;
-  readonly signal: AbortSignal;
-}
-export interface SessionResources {
-  options: CreateSessionOptions;
-  close?(): void | Promise<void>;
-}
 export interface SessionExecutionLifecycle {
   /** Durable guard under the context lock, before opening a session. */
   beforeTurn?(request: LettaTurnRequest): void | Promise<void>;
@@ -80,8 +58,6 @@ export interface SessionExecutionLifecycle {
 export interface SessionPolicy {
   /** Optional awaited execution journal hooks, all under the context lock. */
   execution?: SessionExecutionLifecycle;
-  /** Trusted governance check inside the context lock, immediately before session setup. */
-  beforeTurn?(request: LettaTurnRequest): void | Promise<void>;
   /** Optional idle-conversation continuity, called under the execution lock.
    * Keys are already owner-scoped by the host. Never fall back to unowned keys.
    * This is not active-task persistence or crash/restart reconciliation.
@@ -93,10 +69,8 @@ export interface SessionPolicy {
   };
   /** Explicit shared trust domain; this runtime is not a multi-tenant mapper. */
   sharingDomain: string;
-  /** Application must govern persisted tools separately before binding this runner. */
-  sessionOptions:
-    | CreateSessionOptions
-    | ((scope: SessionScope) => SessionResources);
+  /** Normal runtime options; the application supplies its noninteractive approval policy. */
+  sessionOptions: CreateSessionOptions;
 }
 
 /** One execution owner, one existing agent, dedicated in-memory context mapping. */
@@ -135,29 +109,13 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
     throwIfCancelled(request.signal);
     if (this.unresolved.has(request.a2aContextId))
       throw new Error("Context execution requires reconciliation");
-    await this.policy.beforeTurn?.(request);
-    throwIfCancelled(request.signal);
     await this.policy.execution?.beforeTurn?.(request);
     throwIfCancelled(request.signal);
     const known =
       this.conversations.get(request.a2aContextId) ??
       (await this.policy.conversationMapping?.get(request.a2aContextId));
     throwIfCancelled(request.signal);
-    let conversationId = known;
-    const setup: SessionResources =
-      typeof this.policy.sessionOptions === "function"
-        ? this.policy.sessionOptions({
-            agentId: this.agentId,
-            caller: request.caller,
-            a2aContextId: request.a2aContextId,
-            protocolContextId: request.protocolContextId,
-            messageId: request.messageId,
-            get conversationId() {
-              return conversationId;
-            },
-            signal: request.signal,
-          })
-        : { options: this.policy.sessionOptions };
+    const options = { ...this.policy.sessionOptions };
     let sent = false;
     let result: SDKResultMessage | undefined;
     let assistantText = "";
@@ -171,10 +129,10 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
       request.onActivity?.(label);
     };
     try {
-      try {
+      {
         await using session = known
-          ? this.client.resumeSession(known, setup.options)
-          : this.client.createSession(this.agentId, setup.options);
+          ? this.client.resumeSession(known, options)
+          : this.client.createSession(this.agentId, options);
         const abortSession = () => {
           void session.abort().catch(() => undefined);
         };
@@ -182,7 +140,6 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
         try {
           const ready = await session.ready();
           throwIfCancelled(request.signal);
-          conversationId = ready.conversationId;
           await this.policy.conversationMapping?.set(
             request.a2aContextId,
             ready.conversationId,
@@ -204,7 +161,7 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
             // Only typed top-level SDK messages are activity evidence. Raw
             // stream_event envelopes (including internal/nested streams) stay private.
             if (message.type === "assistant") {
-              // 0.8.28 generates app-server-N/cloud-N per delta without a
+              // The SDK generates app-server-N/cloud-N per delta without a
               // wire ID. Those are not message boundaries; prefer lineage or
               // keep accumulating, as the SDK's finalAssistantText does.
               const key = /^(app-server|cloud)-[0-9]+$/.test(message.uuid)
@@ -236,13 +193,9 @@ export class AgentSdkTurnRunner implements LettaTurnRunner {
         } finally {
           request.signal.removeEventListener("abort", abortSession);
         }
-      } finally {
-        // SDK 0.8.3 does not pass a cancellation signal to external tools.
-        // Their controller-owned lifecycle must be closed explicitly too.
-        await setup.close?.();
       }
       // Interpret results only after all owned cleanup has settled. The SDK
-      // synthesizes failures on disconnect. Code 0.30.25 also emits interrupted
+      // synthesizes failures on disconnect. The SDK may emit interrupted
       // status before backend cancellation settles, so it is not cancellation proof.
       if (!result)
         throw new Error("The Letta Agent SDK stream ended without a result");

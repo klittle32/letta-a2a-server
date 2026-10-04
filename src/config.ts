@@ -156,11 +156,6 @@ function decodeConfig<A>(schema: Schema.Codec<A, unknown, never, never>, value: 
   }
 }
 
-export function parseConfig(value: unknown): ServerConfig {
-  if (isRecord(value) && Object.hasOwn(value, "peers")) throw unsupportedPeers();
-  return decodeConfig(serverConfigSchema, value);
-}
-
 export function parseApplicationConfig(value: unknown): ApplicationConfig {
   try {
     if (isRecord(value) && Object.hasOwn(value, "peers")) throw unsupportedPeers();
@@ -246,15 +241,6 @@ function unsupportedPeers(): ConfigurationError {
 export class SdkConfigurationError extends Schema.TaggedError<SdkConfigurationError>()("SdkConfigurationError", {
   message: Schema.String,
 }) {}
-export const loadConfig = Effect.fn("loadConfig")(function*(
-  path: string,
-): Effect.fn.Return<ServerConfig, ConfigurationError, FileSystem.FileSystem> {
-  const value = yield* loadJson(path);
-  return yield* Effect.try({
-    try: () => decodeConfig(serverConfigSchema, value),
-    catch: (error) => error instanceof ConfigurationError ? error : new ConfigurationError({ message: "Invalid server configuration" }),
-  });
-});
 
 export function sdkOptions(
   config: ServerConfig["backend"],

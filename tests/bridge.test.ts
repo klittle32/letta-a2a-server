@@ -3,12 +3,11 @@ import type {
   CreateSessionOptions,
   LettaAgentClient,
 } from "@letta-ai/letta-agent-sdk";
-import { AgentSdkTurnRunner, type SessionScope } from "../src/bridge/letta-agent.js";
+import { AgentSdkTurnRunner } from "../src/bridge/letta-agent.js";
 
-describe("session-owned tool resources", () => {
-  test("binds ready conversation identity and disposes per-session tools after the SDK", async () => {
+describe("SDK session ownership", () => {
+  test("uses plain session options and resumes the ready conversation", async () => {
     const events: string[] = [];
-    const scopes: SessionScope[] = [];
     const opened: string[] = [];
     const open = (_id: string, options: CreateSessionOptions) => ({
       async ready() {
@@ -16,7 +15,6 @@ describe("session-owned tool resources", () => {
       },
       async send() {
         expect(options.cwd).toBe("/workspace");
-        expect(scopes.at(-1)?.conversationId).toBe("conversation");
         events.push("sent");
       },
       async abort() {},
@@ -45,16 +43,7 @@ describe("session-owned tool resources", () => {
     } as unknown as Pick<LettaAgentClient, "createSession" | "resumeSession">;
     const runner = new AgentSdkTurnRunner(client, "agent", {
       sharingDomain: "local",
-      sessionOptions(scope) {
-        scopes.push(scope);
-        expect(scope.agentId).toBe("agent");
-        return {
-          options: { cwd: "/workspace" },
-          async close() {
-            events.push("tools disposed");
-          },
-        };
-      },
+      sessionOptions: { cwd: "/workspace" },
     });
     for (let turn = 0; turn < 2; turn++) {
       const signal = new AbortController().signal;
@@ -63,24 +52,14 @@ describe("session-owned tool resources", () => {
         messageId: `message-${turn}`,
         text: "hi",
         signal,
-        onAssistantText() {},
       });
-      expect(scopes[turn]?.signal).toBe(signal);
     }
-    expect(scopes).toHaveLength(2);
     expect(opened).toEqual(["create:agent", "resume:conversation"]);
-    expect(scopes[0]).not.toBe(scopes[1]);
-    expect(events).toEqual([
-      "sent",
-      "sdk disposed",
-      "tools disposed",
-      "sent",
-      "sdk disposed",
-      "tools disposed",
-    ]);
+    expect(events).toEqual(["sent", "sdk disposed", "sent", "sdk disposed"]);
   });
 
-  test("failed tool cleanup quarantines an otherwise successful turn", async () => {
+  test("failed SDK cleanup quarantines an otherwise successful turn", async () => {
+    const events: string[] = [];
     const client = {
       createSession() {
         return {
@@ -98,7 +77,7 @@ describe("session-owned tool resources", () => {
               durationMs: 1,
             };
           },
-          async [Symbol.asyncDispose]() {},
+          async [Symbol.asyncDispose]() { events.push("disposed"); throw new Error("SDK cleanup incomplete"); },
         };
       },
       resumeSession() {
@@ -107,12 +86,8 @@ describe("session-owned tool resources", () => {
     } as unknown as Pick<LettaAgentClient, "createSession" | "resumeSession">;
     const runner = new AgentSdkTurnRunner(client, "agent", {
       sharingDomain: "local",
-      sessionOptions: () => ({
-        options: {},
-        async close() {
-          throw new Error("Tool cleanup incomplete");
-        },
-      }),
+      sessionOptions: {},
+      execution: { stopped() { events.push("stopped"); } },
     });
     const run = () =>
       runner.runTurn({
@@ -120,9 +95,9 @@ describe("session-owned tool resources", () => {
         messageId: "message",
         text: "hi",
         signal: new AbortController().signal,
-        onAssistantText() {},
       });
-    await expect(run()).rejects.toThrow("Tool cleanup incomplete");
+    await expect(run()).rejects.toThrow("SDK cleanup incomplete");
+    expect(events).toEqual(["disposed"]);
     expect(runner.unresolvedContexts).toEqual(["context"]);
     await expect(run()).rejects.toThrow("reconciliation");
   });
@@ -179,7 +154,7 @@ function runnerFixture(sessions: Session[]) {
     resumeSession: take,
   } as unknown as LettaAgentClient;
   const runner = new AgentSdkTurnRunner(client, "agent", {
-    sessionOptions: () => ({ options: {}, async close() {} }),
+    sessionOptions: {},
     sharingDomain: "test",
   });
   const run = (
@@ -192,7 +167,6 @@ function runnerFixture(sessions: Session[]) {
       signal,
       a2aContextId,
       text: messageId,
-      onAssistantText() {},
     });
   return { runner, run, opened };
 }

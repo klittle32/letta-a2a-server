@@ -12,8 +12,8 @@ import { Effect, Exit, Scope } from "effect";
 import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory } from "@a2a-js/sdk/client";
 import { Role, TaskState, type SendMessageResult } from "@a2a-js/sdk";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
-import { startApplicationServer, startServer } from "../src/server.js";
-import { parseApplicationConfig, parseConfig, sdkOptions, type ServerConfig } from "../src/config.js";
+import { startApplicationServer } from "../src/server.js";
+import { parseApplicationConfig, sdkOptions, type ServerConfig } from "../src/config.js";
 import { agentMessage } from "../src/bridge/a2a-text.js";
 
 const report = (stage: string, values: object = {}) => console.log(JSON.stringify({ ...values, stage }));
@@ -39,13 +39,13 @@ function backendForMode(mode: Mode, remoteUrl = "ws://127.0.0.1:45001", computer
   return { type: "local", harnessBackend: "local" };
 }
 function configurationForMode(mode: Mode) {
-  return parseConfig({ agentId: "fixture-agent", backend: backendForMode(mode), port: 0, publicUrl: "http://127.0.0.1:0" });
+  return parseApplicationConfig({ agentId: "fixture-agent", backend: backendForMode(mode), port: 0, publicUrl: "http://127.0.0.1:0" });
 }
 function checkBackendConfigurationPaths() {
   const fixtureEnv = { LETTA_API_KEY: "fixture-cloud-key", SMOKE_REMOTE_TOKEN: "fixture-remote-token" };
   for (const mode of ["local", "remote", "cloud", "computer"] as const) {
     const config = configurationForMode(mode);
-    const options = sdkOptions(config.backend, fixtureEnv);
+    const options = sdkOptions(config.bindings[0]!.backend, fixtureEnv);
     assert(options);
     if (mode === "local") assert(options.backend === "local");
     if (mode === "remote") assert(options.backend === "remote" && options.url === "ws://127.0.0.1:45001" && options.authToken === fixtureEnv.SMOKE_REMOTE_TOKEN);
@@ -285,9 +285,25 @@ async function live(mode: Mode, model: string) {
       } finally { readiness.close(); }
     }
     stage = "server"; scope = await Effect.runPromise(Scope.make()); scopeClosed = false; startupPending = true;
-    const server = await deadline(Effect.runPromise(startServer(parseConfig({ agentId: ownedId, backend, port: 0, publicUrl: "http://127.0.0.1:0", ...(process.env.SMOKE_CWD ? { cwd: process.env.SMOKE_CWD } : {}) }), client)
-      .pipe(Effect.provideService(Scope.Scope, scope))).finally(() => { startupPending = false; }));
-    const remote = await deadline(new ClientFactory().createFromUrl(server.url));
+    const config = parseApplicationConfig({ agentId: ownedId, backend, port: 0, publicUrl: "http://127.0.0.1:0", ...(process.env.SMOKE_CWD ? { cwd: process.env.SMOKE_CWD } : {}) });
+    const optionsForBinding = (binding: { backend: ServerConfig["backend"] }) => {
+      const options = sdkOptions(binding.backend, { ...process.env, ...(privateAppServer ? { SMOKE_REMOTE_TOKEN: privateAppServer.token } : {}) });
+      if (binding.backend.type === "local") {
+        if (options?.backend !== "local") throw new Error("local backend options did not narrow");
+        return { ...options, appServer: { ...options.appServer, requestTimeoutMs: limitMs, startupTimeoutMs: limitMs } };
+      }
+      if (binding.backend.type === "remote") {
+        if (options?.backend !== "remote") throw new Error("remote backend options did not narrow");
+        return { ...options, requestTimeoutMs: limitMs, pinGlobalAgent: false };
+      }
+      if (options?.backend !== "cloud") throw new Error("cloud backend options did not narrow");
+      return { ...options, requestTimeoutMs: limitMs,
+        ...(binding.backend.type === "cloud" && mode === "cloud" ? { sandbox: { ttlMinutes: 5, terminateOnClose: true, readyTimeoutMs: limitMs } } : {}) };
+    };
+    const server = await deadline(Effect.runPromise(startApplicationServer(config, (binding) =>
+      new ActualClient(optionsForBinding(binding))).pipe(Effect.provideService(Scope.Scope, scope)))
+      .finally(() => { startupPending = false; }));
+    const remote = await deadline(new ClientFactory().createFromUrl(server.bindings.default!));
     const recall = randomUUID();
     stage = "answer"; executionMayBeActive = true;
     const first = await turn(remote, `Remember token ${recall}. Reply with SMOKE_READY and the token.`); executionMayBeActive = false;
@@ -311,6 +327,8 @@ async function live(mode: Mode, model: string) {
         throw new Error("agent still retrievable");
       });
     } else if (createdId || creationPending) cleanupFailures.push(executionMayBeActive ? "agent_retained_execution_outcome_unknown" : "agent_retained_execution_or_creation_unknown");
+    // startApplicationServer's scope closes its factory-created execution client
+    // before this management client is used to delete the fixture agent.
     if (client) await cleanup("sdk_client", () => client!.close());
     if (privateAppServer) await cleanup("private_app_server", privateAppServer.stop);
     if (home && scopeClosed && !cleanupFailures.length) await cleanup("temp_home", () => rm(home!, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }));

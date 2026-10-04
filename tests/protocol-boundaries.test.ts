@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { Effect, Exit, Scope } from "effect";
 import type { LettaAgentClient, SDKMessage } from "@letta-ai/letta-agent-sdk";
 import { CancelTaskRequest, GetTaskRequest, ListTasksRequest, SubscribeToTaskRequest, TaskState, SendMessageRequest, type Task } from "@a2a-js/sdk";
+import { ServerCallContext } from "@a2a-js/sdk/server";
 import { AgentSdkTurnRunner, LettaTurnCancelledError, type LettaTurnRequest } from "../src/bridge/letta-agent.js";
 import { createBridge, listenLoopback } from "../src/bridge/bridge.js";
 import { testClient } from "./helpers/a2a-client.js";
@@ -18,7 +19,7 @@ function request(text: string, contextId: string = crypto.randomUUID(), messageI
     configuration: { blocking: true, returnImmediately: false } });
 }
 function turn(contextId: string, signal = new AbortController().signal): LettaTurnRequest {
-  return { a2aContextId: contextId, messageId: crypto.randomUUID(), text: contextId, signal, onAssistantText() {} };
+  return { a2aContextId: contextId, messageId: crypto.randomUUID(), text: contextId, signal };
 }
 function completedMessage(conversationId: string, result: string): SDKMessage {
   return { type: "result", success: true, result, durationMs: 1, conversationId };
@@ -62,6 +63,56 @@ test("same-context SDK turns serialize while independent contexts can run concur
   expect((await first).text).toBe("conversation-1");
   expect((await queued).text).toBe("conversation-1");
   expect(opened).toEqual(["same", "other", "same"]);
+});
+
+test("one runner keeps identical wire context IDs separate for different trusted owners", async () => {
+  let created = 0;
+  const resumed: string[] = [];
+  const open = (conversationId: string) => ({
+    async ready() { return { conversationId }; },
+    async send() {}, async abort() {},
+    async *stream() { yield completedMessage(conversationId, conversationId); },
+    async [Symbol.asyncDispose]() {},
+  });
+  const runner = new AgentSdkTurnRunner({
+    createSession: () => open(`conversation-${++created}`),
+    resumeSession: (id: string) => { resumed.push(id); return open(id); },
+  } as unknown as LettaAgentClient, "same-agent", { sharingDomain: "owner-test", sessionOptions: {} });
+  const context = (owner: string) => new ServerCallContext({ user: { isAuthenticated: true, userName: owner }, tenant: "same-tenant" });
+  const bridge = createBridge({
+    runner, sharingDomain: "owner-test", publicBaseUrl: "http://127.0.0.1:0",
+    auth: {
+      projectCaller: async (input) => ({ issuer: "test", subject: input.user?.userName ?? "", tenant: "same-tenant" }),
+      authorize: async () => true,
+    },
+  });
+  try {
+    const alice = await bridge.requestHandler.sendMessage(request("hello", "shared-wire-context"), context("alice"));
+    const bob = await bridge.requestHandler.sendMessage(request("hello", "shared-wire-context"), context("bob"));
+    task(alice); task(bob);
+    expect(alice.contextId).toBe(bob.contextId);
+    expect(created).toBe(2);
+    await bridge.requestHandler.sendMessage(request("again", "shared-wire-context"), context("alice"));
+    await bridge.requestHandler.sendMessage(request("again", "shared-wire-context"), context("bob"));
+    expect(resumed).toEqual(["conversation-1", "conversation-2"]);
+    await expect(bridge.requestHandler.getTask(GetTaskRequest.fromJSON({ id: alice.id }), context("bob"))).rejects.toThrow();
+    await expect(bridge.requestHandler.cancelTask(CancelTaskRequest.fromJSON({ id: bob.id }), context("alice"))).rejects.toThrow();
+  } finally { expect((await bridge.close()).complete).toBe(true); }
+});
+
+test("execution beforeTurn rejection precedes mapping lookup and SDK session creation", async () => {
+  const events: string[] = [];
+  const runner = new AgentSdkTurnRunner({
+    createSession() { events.push("create"); throw new Error("must not create"); },
+    resumeSession() { events.push("resume"); throw new Error("must not resume"); },
+  } as unknown as LettaAgentClient, "existing", {
+    sharingDomain: "guard",
+    sessionOptions: {},
+    conversationMapping: { get() { events.push("mapping lookup"); return undefined; }, set() {} },
+    execution: { async beforeTurn() { events.push("beforeTurn"); throw new Error("durable guard rejected"); } },
+  });
+  await expect(runner.runTurn(turn("guarded"))).rejects.toThrow("durable guard rejected");
+  expect(events).toEqual(["beforeTurn"]);
 });
 
 test("an interrupted SDK result quarantines its context instead of confirming cancellation or replaying", async () => {

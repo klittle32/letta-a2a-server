@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { LettaAgentClient, SDKMessage } from "@letta-ai/letta-agent-sdk";
 import { Message, TaskState } from "@a2a-js/sdk";
 import { DefaultExecutionEventBus, RequestContext, ServerCallContext, type AgentExecutionEvent } from "@a2a-js/sdk/server";
-import { AgentSdkTurnRunner, LettaTurnCancelledError, type LettaTurnRunner } from "../src/bridge/letta-agent.js";
+import { AgentSdkTurnRunner, type LettaTurnRunner } from "../src/bridge/letta-agent.js";
 import { LettaAgentExecutor } from "../src/bridge/letta-agent-executor.js";
 import { readText } from "../src/bridge/a2a-text.js";
 
@@ -13,7 +13,7 @@ function deferred() {
 }
 const assistant = (content: string, uuid = "answer"): SDKMessage => ({ type: "assistant", content, uuid });
 const result = (success = true): SDKMessage => ({ type: "result", success, result: "commentaryFull answer", durationMs: 1, conversationId: "conversation", stopReason: success ? "end_turn" : "interrupted" });
-function sdkRunner(messages: SDKMessage[], gate = deferred(), cleanupFails = false) {
+function sdkRunner(messages: SDKMessage[], gate = deferred(), cleanupFails = false, succeeds = true) {
   const entered = deferred();
   const session = {
     async ready() { return { conversationId: "conversation" }; },
@@ -22,13 +22,13 @@ function sdkRunner(messages: SDKMessage[], gate = deferred(), cleanupFails = fal
       for (const message of messages) yield message;
       entered.resolve();
       await gate.promise;
-      yield result();
+      yield result(succeeds);
     },
-    async [Symbol.asyncDispose]() {},
+    async [Symbol.asyncDispose]() { if (cleanupFails) throw new Error("PRIVATE cleanup"); },
   };
   const client = { createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient;
   const runner = new AgentSdkTurnRunner(client, "agent", {
-    sharingDomain: "test", sessionOptions: () => ({ options: {}, close() { if (cleanupFails) throw new Error("PRIVATE cleanup"); } }),
+    sharingDomain: "test", sessionOptions: {},
   });
   return { runner, entered, gate };
 }
@@ -72,29 +72,66 @@ test("mocked SDK activity precedes exactly one complete final artifact without p
   expect(x.events.some(e => e.kind === "message")).toBe(false);
 });
 
-for (const outcome of ["failure", "cancel", "uncertain", "cleanup"] as const) {
-  test(`no answer artifact after assistant activity on ${outcome}`, async () => {
-    const f = sdkRunner([assistant("PRIVATE provisional")], deferred(), outcome === "cleanup");
-    const runner: LettaTurnRunner = outcome === "cleanup" ? f.runner : {
-      ...(outcome === "uncertain" ? { unresolvedContexts: [JSON.stringify(["", "", "context"])] } : {}),
-      async runTurn(request) {
-        request.onAssistantText("PRIVATE first");
-        request.onAssistantText("PRIVATE second");
-        if (outcome === "cancel") throw new LettaTurnCancelledError();
-        if (outcome === "failure") throw new Error("PRIVATE error");
-        return { text: "PRIVATE answer" };
-      },
-    };
-    const x = execution(runner);
-    f.gate.resolve();
-    await x.running;
-    expect(artifacts(x.events)).toHaveLength(0);
-    expect(JSON.stringify(x.events)).not.toContain("PRIVATE");
+test("typed SDK assistant text stays private when a later SDK result fails", async () => {
+  const f = sdkRunner([assistant("PRIVATE provisional")], deferred(), false, false);
+  const x = execution(f.runner);
+  await f.entered.promise;
+  expect(statuses(x.events)).toEqual(["Generating response"]);
+  expect(artifacts(x.events)).toHaveLength(0);
+  f.gate.resolve();
+  await x.running;
+  expect(artifacts(x.events)).toHaveLength(0);
+  expect(JSON.stringify(x.events)).not.toContain("PRIVATE");
+});
+
+test("typed SDK assistant text stays private when SDK disposal fails", async () => {
+  const f = sdkRunner([assistant("PRIVATE provisional")], deferred(), true);
+  const x = execution(f.runner);
+  await f.entered.promise;
+  expect(statuses(x.events)).toEqual(["Generating response"]);
+  f.gate.resolve();
+  await x.running;
+  expect(artifacts(x.events)).toHaveLength(0);
+  expect(JSON.stringify(x.events)).not.toContain("PRIVATE");
+});
+
+test("typed SDK assistant text stays private after confirmed cancellation", async () => {
+  const entered = deferred();
+  const interrupted = deferred();
+  const session = {
+    async ready() { return { conversationId: "conversation" }; },
+    async send() {}, async abort() { interrupted.resolve(); },
+    async *stream() {
+      yield assistant("PRIVATE provisional");
+      entered.resolve();
+      await interrupted.promise;
+      yield { ...result(false), result: "PRIVATE canceled answer", stopReason: "interrupted" };
+    },
+    async [Symbol.asyncDispose]() {},
+  };
+  const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
+    "agent", { sharingDomain: "test", sessionOptions: {} });
+  const x = execution(runner);
+  await entered.promise;
+  expect(statuses(x.events)).toEqual(["Generating response"]);
+  await x.executor.cancelTask("task", x.bus);
+  await x.running;
+  expect(artifacts(x.events)).toHaveLength(0);
+  expect(JSON.stringify(x.events)).not.toContain("PRIVATE");
+});
+test("a returned answer stays private while the runner reports an unresolved context", async () => {
+  const x = execution({
+    unresolvedContexts: [JSON.stringify(["", "", "context"])],
+    async runTurn() { return { text: "PRIVATE uncertain answer" }; },
   });
-}
+  await x.running;
+  expect(artifacts(x.events)).toHaveLength(0);
+  expect(JSON.stringify(x.events)).not.toContain("PRIVATE");
+});
+
 for (const state of ["input_required", "auth_required"] as const) {
   test(`${state} carries prompt as status, not answer`, async () => {
-    const x = execution({ async runTurn(request) { request.onAssistantText("provisional"); return { state, text: "Please supply approval" }; } });
+    const x = execution({ async runTurn() { return { state, text: "Please supply approval" }; } });
     await x.running;
     expect(artifacts(x.events)).toHaveLength(0);
     expect(statuses(x.events).at(-1)).toBe("Please supply approval");
@@ -137,7 +174,6 @@ test("official streaming, GetTask, and nonstream all retain the same complete an
   const runner: LettaTurnRunner = {
     async runTurn(request) {
       request.onActivity?.("Thinking");
-      request.onAssistantText("provisional");
       return { text: "Full answer" };
     },
   };

@@ -2,7 +2,7 @@ import express from "express";
 import { timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { Context, Effect, Layer, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AgentSdkTurnRunner, DurableBinding, createBridge, createBridgeRouter } from "./bridge/index.js";
 import { type ApplicationConfig, type ApplicationBindingConfig, type ServerConfig } from "./config.js";
@@ -145,11 +145,9 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
     const runner = new AgentSdkTurnRunner(client, config.agentId, {
       sharingDomain: config.id ?? config.agentId,
       ...(durability ? { conversationMapping: durability.conversationMapping, execution: durability.execution } : {}),
-      sessionOptions() {
-        return { options: { ...(config.cwd ? { cwd: config.cwd } : {}), permissionMode: "standard",
-          canUseTool: async () =>
-            ({ behavior: "deny", message: "This server has no interactive approval UI", interrupt: false }),
-        } };
+      sessionOptions: { ...(config.cwd ? { cwd: config.cwd } : {}), permissionMode: "standard",
+        canUseTool: async () =>
+          ({ behavior: "deny", message: "This server has no interactive approval UI", interrupt: false }),
       },
     });
     const bridge = yield* Effect.acquireRelease(
@@ -175,35 +173,6 @@ const acquireBinding = Effect.fn("Server.acquireBinding")(
     return { bridge };
   },
 );
-
-export const startServer = Effect.fn("Server.start")(
-  function* (config: ServerConfig, client: LettaAgentClient, host = "127.0.0.1") {
-    const { bridge } = yield* acquireBinding(config, client);
-    const app = express();
-    app.disable("x-powered-by");
-    app.get("/healthz", (_request, response) => response.json({ status: "ok" }));
-    app.use(createBridgeRouter(bridge));
-    const listener = yield* acquireHttpListener(app, config.port, host);
-    // Observe the actual listening/error event before advancing acquisition.
-    yield* awaitListener(listener);
-    const address = listener.address() as AddressInfo;
-    const url = new URL(config.publicUrl);
-    if (url.port === "0") {
-      url.port = String(address.port);
-      for (const entry of bridge.card.supportedInterfaces) entry.url = url.href;
-    }
-    return { url: url.href.replace(/\/$/, ""), bridge };
-  },
-);
-
-export class Server extends Context.Service<Server, { readonly url: string }>()("letta-a2a-server/Server") {
-  static layer(config: ServerConfig, create: () => LettaAgentClient, host = "127.0.0.1") {
-    return Layer.effect(Server, Effect.gen(function* () {
-      const client = yield* acquireSdkClient(create);
-      return yield* startServer(config, client, host);
-    }));
-  }
-}
 
 export const startApplicationServer = Effect.fn("Server.startApplicationServer")(
   function* (config: ApplicationConfig, createClient: (binding: ApplicationBindingConfig) => LettaAgentClient, host = "127.0.0.1", env: NodeJS.ProcessEnv = process.env) {

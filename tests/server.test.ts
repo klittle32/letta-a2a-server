@@ -3,9 +3,9 @@ import { Cause, Effect, Exit, Scope } from "effect";
 import type { CreateSessionOptions, LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 import { AGENT_CARD_PATH } from "@a2a-js/sdk";
 import { TaskState } from "@a2a-js/sdk";
-import { parseApplicationConfig, parseConfig } from "../src/config.js";
+import { parseApplicationConfig } from "../src/config.js";
 import { testClient, sendRequest } from "./helpers/a2a-client.js";
-import { startApplicationServer, startServer, acquireSdkClient, withTurnDeadline } from "../src/server.js";
+import { startApplicationServer, acquireSdkClient, withTurnDeadline } from "../src/server.js";
 import { AgentSdkTurnRunner } from "../src/bridge/letta-agent.js";
 
 for (const retrievalFails of [false, true]) {
@@ -27,12 +27,9 @@ for (const retrievalFails of [false, true]) {
     } as unknown as LettaAgentClient;
     const controller = new AbortController();
     let finished = false;
-    const running = Effect.runPromiseExit(Effect.scoped(Effect.gen(function* () {
-      const owned = yield* acquireSdkClient(() => client);
-      return yield* startServer(parseConfig({
-        agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0",
-      }), owned);
-    })), { signal: controller.signal }).then((exit) => { finished = true; return exit; });
+    const running = Effect.runPromiseExit(Effect.scoped(startApplicationServer(
+      parseApplicationConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" }), () => client,
+    )), { signal: controller.signal }).then((exit) => { finished = true; return exit; });
     try {
       await started;
       controller.abort();
@@ -43,7 +40,7 @@ for (const retrievalFails of [false, true]) {
       expect(finished).toBe(false);
       release();
       expect(Exit.isFailure(await running)).toBe(true);
-      expect(events).toEqual(["retrieval settled", "client closed"]);
+    expect(events).toEqual(["retrieval settled", "client closed"]);
     } finally {
       release();
       controller.abort();
@@ -85,24 +82,24 @@ test("client close rejection fails scope exit", async () => {
 
 test("failed listener acquisition closes the owned client and permits later acquisition", async () => {
   let closes = 0;
+  let acquisitions = 0;
   const client = {
     agents: { retrieve: async (id: string) => ({ id }) },
     async close() { closes++; },
   } as unknown as LettaAgentClient;
-  const config = parseConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
+  const config = parseApplicationConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
   await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-    const first = yield* startServer(config, client);
-    const occupied = { ...config, port: Number(new URL(first.url).port) };
-    const failure = yield* Effect.exit(Effect.scoped(Effect.gen(function* () {
-      const owned = yield* acquireSdkClient(() => client);
-      return yield* startServer(occupied, owned);
-    })));
+    const createClient = () => { acquisitions++; return { agents: client.agents, async close() { closes++; } } as LettaAgentClient; };
+    const first = yield* startApplicationServer(config, createClient);
+    const occupiedPort = Number(new URL(first.bindings.default!).port);
+    const occupied = parseApplicationConfig({ agentId: "test", backend: { type: "local" }, port: occupiedPort, publicUrl: `http://127.0.0.1:${occupiedPort}` });
+    const failure = yield* Effect.exit(Effect.scoped(startApplicationServer(occupied, createClient)));
     expect(Exit.isFailure(failure)).toBe(true);
     expect(closes).toBe(1);
-    const another = yield* startServer(config, client);
+    const another = yield* startApplicationServer(config, createClient);
     expect((yield* Effect.tryPromise(() => fetch(`${another.url}/healthz`))).ok).toBe(true);
   })));
-  expect(closes).toBe(1);
+  expect(closes).toBe(acquisitions);
 });
 
 test("active-turn interruption awaits session disposal before client close", async () => {
@@ -132,11 +129,8 @@ test("active-turn interruption awaits session disposal before client close", asy
   let url = "";
   const controller = new AbortController();
   const running = Effect.runPromiseExit(Effect.scoped(Effect.gen(function* () {
-    const owned = yield* acquireSdkClient(() => client);
-    const server = yield* startServer(parseConfig({
-      agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0",
-    }), owned);
-    url = server.url;
+    const server = yield* startApplicationServer(parseApplicationConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" }), () => client);
+    url = server.bindings.default!;
     yield* Effect.sync(listening);
     return yield* Effect.never;
   })), { signal: controller.signal });
@@ -162,10 +156,8 @@ test("active-turn interruption awaits session disposal before client close", asy
     expect(Exit.isFailure(await running)).toBe(true);
     expect(events.slice(-2)).toEqual(["session disposed", "client closed"]);
     // Rebinding the exact port proves that the listener was released.
-    await Effect.runPromise(Effect.scoped(startServer(parseConfig({
-      agentId: "test", backend: { type: "local" },
-      port: Number(new URL(url).port), publicUrl: url,
-    }), client)));
+    await Effect.runPromise(Effect.scoped(startApplicationServer(parseApplicationConfig({ agentId: "test", backend: { type: "local" },
+      port: Number(new URL(url).port), publicUrl: url }), () => client)));
   } finally {
     release();
     controller.abort();
@@ -181,10 +173,10 @@ for (const failure of ["none", "client", "bridge"] as const) {
     const script = `
       import { Effect } from "effect";
       import { NodeRuntime } from "@effect/platform-node";
-      import { Server } from ${JSON.stringify(serverModuleUrl)};
-      import { parseConfig } from ${JSON.stringify(configModuleUrl)};
+      import { startApplicationServer } from ${JSON.stringify(serverModuleUrl)};
+      import { parseApplicationConfig } from ${JSON.stringify(configModuleUrl)};
       import { testClient, sendRequest } from ${JSON.stringify(helperModuleUrl)};
-      const config = parseConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
+      const config = parseApplicationConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" });
       const open = () => ({
         async ready() { return { conversationId: "signal-conversation" }; },
         async send() {}, async abort() {},
@@ -202,17 +194,17 @@ for (const failure of ["none", "client", "bridge"] as const) {
           if (${failure === "client"}) throw new Error("disposal failed");
         },
       };
-      NodeRuntime.runMain(Effect.gen(function* () {
-        const server = yield* Server;
+      NodeRuntime.runMain(Effect.scoped(Effect.gen(function* () {
+        const server = yield* startApplicationServer(config, () => client);
         if (${failure === "bridge"}) {
           yield* Effect.tryPromise(async () => {
-            const remote = await testClient(server.url);
+            const remote = await testClient(server.bindings.default);
             await remote.sendMessage(sendRequest("hello")).catch(() => undefined);
           });
         }
         yield* Effect.sync(() => process.stdout.write("ready\\n"));
         return yield* Effect.never;
-      }).pipe(Effect.provide(Server.layer(config, () => client))));
+      })));
     `;
     const child = Bun.spawn(["node", "--import", "tsx", "--input-type=module", "-e", script], {
       stdout: "pipe", stderr: "pipe",
@@ -270,33 +262,30 @@ test("direct discovery and two turns use an existing agent and preserve conversa
     async close() { clientCloses++; },
   } as unknown as LettaAgentClient;
   const scope = await Effect.runPromise(Scope.make());
-  const server = await Effect.runPromise(startServer(parseConfig({
+  const app = await Effect.runPromise(startApplicationServer(parseApplicationConfig({
     agentId: "agent-test", backend: { type: "local" }, port: 0,
     publicUrl: "http://127.0.0.1:0",
-  }), client).pipe(Effect.provideService(Scope.Scope, scope)));
-  const remote = await testClient(server.url);
+  }), () => client).pipe(Effect.provideService(Scope.Scope, scope)));
+  const server = { ...app, url: app.bindings.default! };
+  const remote = await testClient(server.bindings.default!);
   try {
-    const response = await fetch(`${server.url}/${AGENT_CARD_PATH}`);
+    const response = await fetch(`${server.bindings.default!}/${AGENT_CARD_PATH}`);
     expect(response.ok).toBe(true);
     const card = await response.json() as { supportedInterfaces: { url: string }[] };
-    expect(card.supportedInterfaces[0]?.url).toBe(`${server.url}/`);
+    expect(card.supportedInterfaces[0]?.url).toBe(`${server.bindings.default!}/`);
     const first = await remote.sendMessage(sendRequest("hello"));
     const second = await remote.sendMessage(sendRequest("again", first.contextId));
     expect(second.contextId).toBe(first.contextId);
     expect(opened).toEqual(["agent-test", "conv-test"]);
     expect(disposals).toBe(2);
     const options = sessionOptions[0]!;
-    expect(options.tools).toBeUndefined();
     expect(options.permissionMode).toBe("standard");
-    expect(options.allowedTools).toBeUndefined();
-    expect(options.toolset).toBeUndefined();
-    expect(options.skillSources).toBeUndefined();
-    for (const tool of ["a2a_invoke", "Bash", "nativeBash"]) {
+    expect(options.cwd).toBeUndefined();
+    for (const tool of ["a2a_invoke", "Bash", "nativeBash"])
       expect((await options.canUseTool!(tool, {})).behavior).toBe("deny");
-    }
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
-    expect(clientCloses).toBe(0); // Injected clients remain caller-owned.
+    expect(clientCloses).toBe(1); // Factory-created application clients are scope-owned.
   }
 }, 15000);
 
@@ -408,7 +397,7 @@ test("turn deadline retains an incoming A2A abort signal", async () => {
   }), resumeSession() { throw new Error("Unexpected resume"); } } as unknown as LettaAgentClient;
   const runner = new AgentSdkTurnRunner(client, "agent", { sharingDomain: "incoming", sessionOptions: {} });
   const controller = new AbortController();
-  const pending = withTurnDeadline(runner, 120_000).runTurn({ a2aContextId: "context", messageId: "message", text: "wait", signal: controller.signal, onAssistantText() {} });
+  const pending = withTurnDeadline(runner, 120_000).runTurn({ a2aContextId: "context", messageId: "message", text: "wait", signal: controller.signal });
   await started;
   await new Promise((resolve) => setTimeout(resolve, 0));
   controller.abort(new Error("caller cancelled"));
@@ -485,8 +474,9 @@ test("single-agent root binding serves health, card discovery, and invocation", 
   const scope = await Effect.runPromise(Scope.make());
   const server = await Effect.runPromise(startApplicationServer(config, () => client).pipe(Effect.provideService(Scope.Scope, scope)));
   try {
-    expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
-    const card = await fetch(`${server.url}/${AGENT_CARD_PATH}`);
+    const url = server.bindings.default!;
+    expect((await fetch(`${url}/healthz`)).status).toBe(200);
+    const card = await fetch(`${url}/${AGENT_CARD_PATH}`);
     expect(card.status).toBe(200);
     const body = await card.json() as { name: string };
     expect(body.name).toBe("Letta A2A Agent");
@@ -533,10 +523,7 @@ test("launcher ownership closes its client when startup fails", async () => {
     agents: { retrieve: async () => { throw new Error("startup failed"); } },
     async close() { await Promise.resolve(); closed = true; },
   } as unknown as LettaAgentClient;
-  await expect(Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-    const owned = yield* acquireSdkClient(() => client);
-    return yield* startServer(parseConfig({ agentId: "test", backend: { type: "local" } }), owned);
-  }))))
+  await expect(Effect.runPromise(Effect.scoped(startApplicationServer(parseApplicationConfig({ agentId: "test", backend: { type: "local" } }), () => client))))
     .rejects.toThrow("retrieval failed");
   expect(closed).toBe(true);
 });
@@ -562,13 +549,8 @@ for (const incomplete of [false, true]) {
       async close() { await Promise.resolve(); events.push("client closed"); },
     } as unknown as LettaAgentClient;
     const scope = await Effect.runPromise(Scope.make());
-    const server = await Effect.runPromise(Effect.gen(function* () {
-      const owned = yield* acquireSdkClient(() => client);
-      return yield* startServer(parseConfig({
-      agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0",
-    }), owned);
-    }).pipe(Effect.provideService(Scope.Scope, scope)));
-    const remote = await testClient(server.url);
+    const server = await Effect.runPromise(startApplicationServer(parseApplicationConfig({ agentId: "test", backend: { type: "local" }, port: 0, publicUrl: "http://127.0.0.1:0" }), () => client).pipe(Effect.provideService(Scope.Scope, scope)));
+    const remote = await testClient(server.bindings.default!);
     try {
       const call = remote.sendMessage(sendRequest("hello"));
       if (incomplete) await call.catch(() => undefined);
@@ -583,6 +565,30 @@ for (const incomplete of [false, true]) {
 
 test("startup refuses an unresolved existing-agent binding without creating an agent", async () => {
   const client = { agents: { retrieve: async () => ({ id: "wrong-agent" }) } } as unknown as LettaAgentClient;
-  await expect(Effect.runPromise(Effect.scoped(startServer(parseConfig({ agentId: "agent-test", backend: { type: "local" } }), client))))
+  await expect(Effect.runPromise(Effect.scoped(startApplicationServer(parseApplicationConfig({ agentId: "agent-test", backend: { type: "local" } }), () => client))))
     .rejects.toThrow("identity");
+});
+
+test("application execution client closes before the borrowed management client deletes its agent", async () => {
+  const events: string[] = [];
+  const id = "fixture-agent";
+  const management = {
+    agents: {
+      async retrieve(agentId: string) { events.push(`retrieve:${agentId}`); return { id: agentId }; },
+      async delete(agentId: string) { events.push(`delete:${agentId}`); },
+    },
+    async close() { events.push("management-close"); },
+  } as unknown as LettaAgentClient;
+  let execution: LettaAgentClient | undefined;
+  const scope = await Effect.runPromise(Scope.make());
+  await Effect.runPromise(startApplicationServer(parseApplicationConfig({ agentId: id, backend: { type: "local" }, port: 0,
+    publicUrl: "http://127.0.0.1:0" }), () => {
+      execution = { agents: management.agents, async close() { events.push("execution-close"); } } as unknown as LettaAgentClient;
+      return execution;
+    }).pipe(Effect.provideService(Scope.Scope, scope)));
+  expect(execution).toBeDefined();
+  await Effect.runPromise(Scope.close(scope, Exit.void));
+  await management.agents.delete(id);
+  await management.close();
+  expect(events).toEqual(["retrieve:fixture-agent", "execution-close", "delete:fixture-agent", "management-close"]);
 });

@@ -140,9 +140,9 @@ test("restart marks sent interrupted work uncertain and refuses context replay",
     await binding.accept(request, initial, "artifact");
     await binding.dispatched(request);
     await binding.execution.beforeSend!({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "send once", signal: AbortSignal.timeout(1000), onAssistantText() {} }, { agentId: "uncertain-agent", conversationId: "uncertain-conversation", otid: message.messageId });
+      text: "send once", signal: AbortSignal.timeout(1000) }, { agentId: "uncertain-agent", conversationId: "uncertain-conversation", otid: message.messageId });
     await binding.execution.unresolved!({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "send once", signal: AbortSignal.timeout(1000), onAssistantText() {} });
+      text: "send once", signal: AbortSignal.timeout(1000) });
     await binding.close();
     const reopened = await DurableBinding.open({ directory: root, bindingId: "uncertain-binding" });
     expect(reopened.inspectRecovery()).toHaveLength(1);
@@ -166,7 +166,7 @@ test("restart never publishes provisional text from an unresolved turn", async (
     await binding.accept(request, initial, "provisional-artifact");
     await binding.dispatched(request);
     const turn = { taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+      text: "hello", signal: AbortSignal.timeout(1000) };
     await binding.execution.beforeSend!(turn, { agentId: "provisional-agent", conversationId: "provisional-conversation", otid: message.messageId });
     await binding.execution.observe!(turn, { type: "assistant", content: "PRIVATE provisional answer", uuid: "delta" });
     await binding.execution.observe!(turn, { type: "result", success: false, result: "PRIVATE full result", durationMs: 1, conversationId: "provisional-conversation", stopReason: "interrupted" });
@@ -224,7 +224,7 @@ test("SDK observations use keyed correlation and ignore irrelevant payloads", as
     const request = new RequestContext({ tenant: "", configuration: undefined, metadata: undefined, message }, "observed-task", "observed-context", context);
     const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
     await binding.accept(request, initial, "observed-artifact");
-    const turn = { taskId: request.taskId, a2aContextId: executionContextKey(request), messageId: message.messageId, text: "hi", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+    const turn = { taskId: request.taskId, a2aContextId: executionContextKey(request), messageId: message.messageId, text: "hi", signal: AbortSignal.timeout(1000) };
     const executionKey = JSON.stringify([JSON.parse(turn.a2aContextId)[0], JSON.parse(turn.a2aContextId)[1], message.messageId]);
     executionScans = 0;
     executionReads = 0;
@@ -270,7 +270,7 @@ test("SDK turn correlation fails closed for mismatched and malformed keys", asyn
     const initial = Task.fromJSON({ id: request.taskId, contextId: request.contextId, status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] });
     await binding.accept(request, initial, "correlation-artifact");
     const key = executionContextKey(request);
-    const turn = { taskId: request.taskId, a2aContextId: key, messageId: message.messageId, text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+    const turn = { taskId: request.taskId, a2aContextId: key, messageId: message.messageId, text: "hello", signal: AbortSignal.timeout(1000) };
     await binding.execution.observe!(turn, { type: "loop_status", activeRunIds: [], status: "running" });
     const { taskId: _taskId, ...withoutTaskId } = turn;
     await expect(binding.execution.observe!(withoutTaskId, { type: "loop_status", activeRunIds: [], status: "running" })).resolves.toBeUndefined();
@@ -302,7 +302,7 @@ test("oversized settled answers and run IDs remain bounded without provisional j
       status: { state: TaskState.TASK_STATE_SUBMITTED }, artifacts: [], history: [message] }), "budget-artifact");
     await binding.dispatched(request);
     const turn = { taskId: request.taskId, a2aContextId: executionContextKey(request), messageId: message.messageId,
-      text: "hello", signal: new AbortController().signal, onAssistantText() {} };
+      text: "hello", signal: new AbortController().signal };
     await binding.execution.beforeSend!(turn, { agentId: "budget-agent", conversationId: "budget-conversation", otid: message.messageId });
     const oversized = "PRIVATE".repeat(1024);
     await expect(binding.execution.observe!(turn, { type: "assistant", content: oversized, uuid: "answer" })).resolves.toBeUndefined();
@@ -349,14 +349,14 @@ test("runner cancellation during owned cleanup recovers without an answer", asyn
         yield { type: "assistant", content: "PRIVATE provisional", uuid: "answer" };
         yield { type: "result", success: true, result: "PRIVATE provisional", durationMs: 1, conversationId: "cleanup-cancel-conversation", stopReason: "end_turn" };
       },
-      async [Symbol.asyncDispose]() {},
+      async [Symbol.asyncDispose]() { cleanupEntered(); await cleanupGate; },
     };
     const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
       "cleanup-cancel-agent", { sharingDomain: "test", execution: binding.execution,
-        sessionOptions: () => ({ options: {}, async close() { cleanupEntered(); await cleanupGate; } }) });
+        sessionOptions: {} });
     const controller = new AbortController();
     const running = runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "hello", signal: controller.signal, onAssistantText() {} });
+      text: "hello", signal: controller.signal });
     await cleanupStarted;
     controller.abort();
     releaseCleanup();
@@ -387,6 +387,7 @@ test("runner and SQLite recovery share the filtered final answer boundary", asyn
     await binding.accept(request, initial, "final-answer-artifact");
     await binding.dispatched(request);
     let cleaned = false;
+    let stopObservedDisposal = false;
     const session = {
       async ready() { return { conversationId: "final-answer-conversation" }; },
       async send() {}, async abort() {},
@@ -397,19 +398,26 @@ test("runner and SQLite recovery share the filtered final answer boundary", asyn
         yield { type: "assistant", content: "answer", uuid: "final" };
         yield { type: "result", success: true, result: "PRIVATE pre-tool commentaryFinal answer", durationMs: 1, conversationId: "final-answer-conversation", stopReason: "end_turn" };
       },
-      async [Symbol.asyncDispose]() {},
+      async [Symbol.asyncDispose]() { cleaned = true; },
     };
     const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
-      "final-answer-agent", { sharingDomain: "test", execution: binding.execution,
-        sessionOptions: () => ({ options: {}, close() { cleaned = true; } }) });
+      "final-answer-agent", { sharingDomain: "test", execution: {
+        ...binding.execution,
+        stopped: async (...args) => {
+          stopObservedDisposal = cleaned;
+          await binding.execution.stopped?.(...args);
+        },
+      },
+        sessionOptions: {} });
     await runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} });
+      text: "hello", signal: AbortSignal.timeout(1000) });
     const executionKey = JSON.stringify([JSON.parse(contextKey)[0], JSON.parse(contextKey)[1], message.messageId]);
     const stopped = binding["storage"].getRecord<{ eligibleAnswer?: string; publicChunks: string[]; resultText?: string }>("executions", executionKey);
     expect(stopped?.eligibleAnswer).toBe("Final answer");
     expect(stopped?.publicChunks).toEqual([]);
     expect(stopped?.resultText).toBeUndefined();
     expect(cleaned).toBe(true);
+    expect(stopObservedDisposal).toBe(true);
     await binding.close();
 
     const reopened = await DurableBinding.open({ directory: root, bindingId: "final-answer-binding" });
@@ -446,9 +454,9 @@ test("result-only runner success recovers the actual final result", async () => 
       async [Symbol.asyncDispose]() {},
     };
     const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
-      "result-only-agent", { sharingDomain: "test", execution: binding.execution, sessionOptions: () => ({ options: {} }) });
+      "result-only-agent", { sharingDomain: "test", execution: binding.execution, sessionOptions: {} });
     await runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} });
+      text: "hello", signal: AbortSignal.timeout(1000) });
     await binding.close();
 
     const reopened = await DurableBinding.open({ directory: root, bindingId: "result-only-binding" });
@@ -480,13 +488,13 @@ test.each(["result", "cleanup"] as const)("runner %s failure stays answer-free a
         yield { type: "assistant", content: "PRIVATE provisional", uuid: "answer" };
         yield { type: "result", success: failure !== "result", result: "PRIVATE result", durationMs: 1, conversationId: "cleanup-failure-conversation", stopReason: "end_turn" };
       },
-      async [Symbol.asyncDispose]() {},
+      async [Symbol.asyncDispose]() { if (failure === "cleanup") throw new Error("cleanup failed"); },
     };
     const runner = new AgentSdkTurnRunner({ createSession: () => session, resumeSession: () => session } as unknown as LettaAgentClient,
       "cleanup-failure-agent", { sharingDomain: "test", execution: binding.execution,
-        sessionOptions: () => ({ options: {}, close() { if (failure === "cleanup") throw new Error("cleanup failed"); } }) });
+        sessionOptions: {} });
     await expect(runner.runTurn({ taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} })).rejects.toThrow(failure === "cleanup" ? "cleanup failed" : "requires reconciliation");
+      text: "hello", signal: AbortSignal.timeout(1000) })).rejects.toThrow(failure === "cleanup" ? "cleanup failed" : "requires reconciliation");
     await binding.close();
 
     const reopened = await DurableBinding.open({ directory: root, bindingId: "cleanup-failure-binding" });
@@ -512,7 +520,7 @@ test("cancellation after stop prevents completed answer recovery", async () => {
     await binding.accept(request, initial, "stopped-cancel-artifact");
     await binding.dispatched(request);
     const turn = { taskId: request.taskId, a2aContextId: contextKey, messageId: message.messageId,
-      text: "hello", signal: AbortSignal.timeout(1000), onAssistantText() {} };
+      text: "hello", signal: AbortSignal.timeout(1000) };
     await binding.execution.beforeSend!(turn, { agentId: "agent", conversationId: "conversation", otid: message.messageId });
     await binding.execution.stopped!(turn, "PRIVATE eligible answer");
     await binding.requestCancellation(request.taskId, context);

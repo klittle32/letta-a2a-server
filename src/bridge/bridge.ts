@@ -36,12 +36,7 @@ import {
   jsonRpcHandler,
   UserBuilder,
 } from "@a2a-js/sdk/server/express";
-import type { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
-import {
-  AgentSdkTurnRunner,
-  type LettaTurnRunner,
-  type SessionPolicy,
-} from "./letta-agent.js";
+import type { LettaTurnRunner } from "./letta-agent.js";
 import {
   LettaAgentExecutor,
   type CloseResult,
@@ -88,23 +83,7 @@ export interface BridgeOptions {
   durabilityAgentId?: string;
   shutdownTimeoutMs?: number;
 }
-export type CreateBridgeOptions = BridgeOptions &
-  (
-    | {
-        runner: LettaTurnRunner;
-        client?: never;
-        agentId?: never;
-        sessionOptions?: never;
-        beforeTurn?: never;
-      }
-    | {
-        runner?: never;
-        client: LettaAgentClient;
-        agentId: string;
-        sessionOptions: SessionPolicy["sessionOptions"];
-        beforeTurn?: SessionPolicy["beforeTurn"];
-      }
-  );
+export type CreateBridgeOptions = BridgeOptions & { runner: LettaTurnRunner };
 
 /** No agents, sockets, hooks or global mods are created by importing this module. */
 export function createBridge(options: CreateBridgeOptions) {
@@ -125,20 +104,10 @@ export function createBridge(options: CreateBridgeOptions) {
     throw new Error("An explicit sharing domain is required");
   if (options.durability && options.taskStore)
     throw new Error("Durability owns its task store");
-  const runner =
-    options.runner ??
-    new AgentSdkTurnRunner(options.client!, options.agentId!, {
-      sharingDomain: options.sharingDomain,
-      sessionOptions: options.sessionOptions!,
-      ...(options.beforeTurn ? { beforeTurn: options.beforeTurn } : {}),
-      ...(options.durability ? {
-        conversationMapping: options.durability.conversationMapping,
-        execution: options.durability.execution,
-      } : {}),
-    });
+  const runner = options.runner;
   if (options.durability)
     options.durability.bindAgent(
-      options.durabilityAgentId ?? options.agentId ?? options.sharingDomain,
+      options.durabilityAgentId ?? options.sharingDomain,
       options.backendIdentity,
     );
   const executor = new LettaAgentExecutor(

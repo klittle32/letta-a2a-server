@@ -19,8 +19,6 @@ export {
   type LettaTurnResult,
   type LettaTurnRunner,
   type SessionPolicy,
-  type SessionScope,
-  type SessionResources,
   type SessionExecutionLifecycle,
 } from "./letta-agent.js";
 export { DurableBinding, type RecoveryRecord } from "./durable-binding.js";

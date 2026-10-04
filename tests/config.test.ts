@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effect, FileSystem, Schema } from "effect";
-import { ConfigurationError, loadApplicationConfig, loadConfig, parseApplicationConfig, parseConfig, sdkOptions, serverConfigSchema } from "../src/config.js";
+import { ConfigurationError, loadApplicationConfig, parseApplicationConfig, sdkOptions, serverConfigSchema } from "../src/config.js";
 
 const base = { agentId: "agent-example", backend: { type: "local" } };
 
@@ -27,6 +27,16 @@ describe("server configuration", () => {
     const normalized = parseApplicationConfig({ ...base, port: 0, publicUrl: "http://127.0.0.1:0" });
     expect(normalized.bindings).toHaveLength(1);
     expect(normalized.bindings[0]?.path).toBe("");
+    const namedRoot = parseApplicationConfig({ port: 0, publicUrl: "http://127.0.0.1:0/",
+      connections: { local: { type: "local" } },
+      bindings: { default: { path: "", connection: "local", agentId: "agent-example", name: "Letta A2A Agent" } },
+    });
+    expect(namedRoot).toEqual(normalized);
+    const unsupported = { ...base, peers: { secret: "private" } };
+    expect(() => parseApplicationConfig(unsupported)).toThrow("Remove the unsupported 'peers' field");
+    expect(() => parseApplicationConfig({ connections: { local: { type: "local" } }, bindings: {
+      default: { path: "", connection: "local", agentId: "agent-example", peers: { secret: "private" } },
+    } })).toThrow("Remove the unsupported 'peers' field");
     const fs = FileSystem.makeNoop({ readFileString: () => Effect.succeed(JSON.stringify(base)) });
     expect((await Effect.runPromise(loadApplicationConfig("config.json").pipe(Effect.provideService(FileSystem.FileSystem, fs)))).bindings)
       .toHaveLength(1);
@@ -65,22 +75,22 @@ describe("server configuration", () => {
     ]) expect(() => parseApplicationConfig(input)).toThrow(ConfigurationError);
   });
   test("preserves defaults, trimming, optional fields, and exact URL output", () => {
-    const config = parseConfig({ ...base, agentId: " agent-example ", name: " Agent ",
+    const config = parseApplicationConfig({ ...base, agentId: " agent-example ", name: " Agent ",
       port: 0, publicUrl: "http://127.0.0.1:80", cwd: "/work",
-    });
-    expect(config).toEqual({ agentId: "agent-example", name: "Agent", backend: { type: "local" },
-      port: 0, publicUrl: "http://127.0.0.1/", cwd: "/work" });
-    expect(parseConfig({ ...base, name: undefined, port: undefined }).name)
+    }).bindings[0]!;
+    expect(config).toEqual({ id: "default", path: "", publicUrl: "http://127.0.0.1/", agentId: "agent-example", name: "Agent",
+      backend: { type: "local" }, port: 0, cwd: "/work" });
+    expect(parseApplicationConfig({ ...base, name: undefined, port: undefined }).bindings[0]?.name)
       .toBe("Letta A2A Agent");
-    expect(parseConfig(base).port).toBe(41241);
-    expect(parseConfig(base)).not.toHaveProperty("cwd");
-    expect(parseConfig({ ...base, port: 65535 }).port).toBe(65535);
-    expect(sdkOptions(parseConfig({ ...base, backend: { type: "remote", url: "https://example.com",
-      tokenEnv: undefined } }).backend, {})).toEqual({ backend: "remote", url: "https://example.com" });
-    expect(sdkOptions(parseConfig({ ...base, backend: { type: "cloud" } }).backend, {}))
+    expect(parseApplicationConfig(base).port).toBe(41241);
+    expect(parseApplicationConfig(base).bindings[0]).not.toHaveProperty("cwd");
+    expect(parseApplicationConfig({ ...base, port: 65535 }).port).toBe(65535);
+    expect(sdkOptions(parseApplicationConfig({ ...base, backend: { type: "remote", url: "https://example.com",
+      tokenEnv: undefined } }).bindings[0]!.backend, {})).toEqual({ backend: "remote", url: "https://example.com" });
+    expect(sdkOptions(parseApplicationConfig({ ...base, backend: { type: "cloud" } }).bindings[0]!.backend, {}))
       .toEqual({ backend: "cloud" });
     for (const computer of ["pc", { name: "pc" }]) {
-      expect(sdkOptions(parseConfig({ ...base, backend: { type: "cloud", computer } }).backend, {}))
+      expect(sdkOptions(parseApplicationConfig({ ...base, backend: { type: "cloud", computer } }).bindings[0]!.backend, {}))
         .toEqual({ backend: "cloud", computer });
     }
   });
@@ -103,7 +113,7 @@ describe("server configuration", () => {
         expect(JSON.stringify(error)).not.toMatch(/secret-peer|SECRET/);
       }
     }
-    expect(() => parseConfig({ ...base, peers: {} })).toThrow("Remove the unsupported 'peers' field");
+    expect(() => parseApplicationConfig({ ...base, peers: {} })).toThrow("Remove the unsupported 'peers' field");
   });
   test("rejects unsafe binding IDs and state directory overlap", () => {
     for (const id of [".", "..", "../escape"]) {
@@ -130,26 +140,14 @@ describe("server configuration", () => {
       ...["http://127.0.0.1/path", "http://127.0.0.1?secret-marker", "http://127.0.0.1#secret-marker",
         "http://user:secret-marker@127.0.0.1"].map((publicUrl) => ({ ...base, publicUrl })),
     ]) {
-      expect(() => parseConfig(input)).toThrow(ConfigurationError);
-      try { parseConfig(input); } catch (error) {
+      expect(() => parseApplicationConfig(input)).toThrow(ConfigurationError);
+      try { parseApplicationConfig(input); } catch (error) {
         expect(String(error)).not.toContain("secret-marker");
       }
     }
     expect(() => Schema.decodeUnknownSync(serverConfigSchema, { onExcessProperty: "error" })({ ...base, extra: true })).toThrow();
     expect(() => Schema.decodeUnknownSync(serverConfigSchema, { onExcessProperty: "error" })({ ...base,
       backend: { type: "cloud", computer: { name: "pc", extra: true } } })).toThrow();
-  });
-
-  test("loads lazily through the public FileSystem seam", async () => {
-    const reads: string[] = [];
-    const fs = FileSystem.makeNoop({ readFileString: (path) => {
-      reads.push(path);
-      return Effect.succeed(JSON.stringify(base));
-    } });
-    const program = loadConfig("config.json").pipe(Effect.provideService(FileSystem.FileSystem, fs));
-    expect(reads).toEqual([]);
-    expect(await Effect.runPromise(program)).toEqual(parseConfig(base));
-    expect(reads).toEqual(["config.json"]);
   });
 
   test("returns typed, safe read, JSON, and schema errors", async () => {
@@ -159,7 +157,7 @@ describe("server configuration", () => {
       [FileSystem.makeNoop({ readFileString: () => Effect.succeed(JSON.stringify({ ...base, extra: "secret-marker" })) }),
         "Invalid server configuration: [property] (unknown property)"],
     ] as const) {
-      const error = await Effect.runPromise(loadConfig("secret-marker.json").pipe(
+      const error = await Effect.runPromise(loadApplicationConfig("secret-marker.json").pipe(
         Effect.provideService(FileSystem.FileSystem, fs),
         Effect.flip,
       ));
@@ -169,9 +167,9 @@ describe("server configuration", () => {
       expect(JSON.stringify(error)).not.toContain("secret-marker");
     }
   });
-  test("loadConfig keeps schema failures in its typed ConfigurationError channel", async () => {
+  test("application loader keeps schema failures in its typed ConfigurationError channel", async () => {
     const fs = FileSystem.makeNoop({ readFileString: () => Effect.succeed(JSON.stringify({ ...base, backend: { type: "remote" } })) });
-    const error = await Effect.runPromise(loadConfig("config.json").pipe(
+    const error = await Effect.runPromise(loadApplicationConfig("config.json").pipe(
       Effect.provideService(FileSystem.FileSystem, fs), Effect.flip,
     ));
     expect(error).toBeInstanceOf(ConfigurationError);
@@ -186,8 +184,8 @@ describe("server configuration", () => {
   });
 
   test("unknown TLS key remains a schema error and does not masquerade as an HTTPS failure", () => {
-    expect(() => parseConfig({ ...base, TLS: "secret-marker" })).toThrow("unknown property");
-    try { parseConfig({ ...base, TLS: "secret-marker" }); }
+    expect(() => parseApplicationConfig({ ...base, TLS: "secret-marker" })).toThrow("unknown property");
+    try { parseApplicationConfig({ ...base, TLS: "secret-marker" }); }
     catch (error) {
       expect(error).toBeInstanceOf(ConfigurationError);
       expect(JSON.stringify(error)).not.toContain("secret-marker");
@@ -200,7 +198,7 @@ describe("server configuration", () => {
       [{ ...base, backend: { type: "secret-discriminant" } }, "backend"],
       [{ ...base, backend: { type: "local", secretField: "secret-value" } }, "backend (invalid value)"],
     ] as const) {
-      try { parseConfig(input); throw new Error("expected parse failure"); }
+      try { parseApplicationConfig(input); throw new Error("expected parse failure"); }
       catch (error) {
         expect((error as ConfigurationError).message).toContain(expected);
         expect(JSON.stringify(error)).not.toMatch(/secret-value|SECRET_ENV|secret-discriminant/);
@@ -208,16 +206,16 @@ describe("server configuration", () => {
     }
   });
   test("binds an existing agent and defaults to direct loopback", () => {
-    const config = parseConfig(base);
+    const config = parseApplicationConfig(base).bindings[0]!;
     expect(config.agentId).toBe("agent-example");
     expect(config.publicUrl).toBe("http://127.0.0.1:41241/");
     expect(sdkOptions(config.backend, {})).toEqual({ backend: "local" });
   });
 
   test("maps remote credentials from the named environment variable only", () => {
-    const config = parseConfig({ ...base, backend: {
+    const config = parseApplicationConfig({ ...base, backend: {
       type: "remote", url: "http://host.docker.internal:4500", tokenEnv: "APP_SERVER_TOKEN",
-    }});
+    }}).bindings[0]!;
     expect(sdkOptions(config.backend, { APP_SERVER_TOKEN: "test-only" })).toEqual({
       backend: "remote", url: "http://host.docker.internal:4500", authToken: "test-only",
     });
@@ -227,19 +225,19 @@ describe("server configuration", () => {
 
   test("Cloud-backed agents can execute in the local SDK runtime", () => {
     for (const harnessBackend of ["api", "local"] as const) {
-      const config = parseConfig({ ...base, backend: { type: "local", harnessBackend } });
+      const config = parseApplicationConfig({ ...base, backend: { type: "local", harnessBackend } }).bindings[0]!;
       expect(sdkOptions(config.backend, {})).toEqual({
         backend: "local", appServer: { harnessBackend, pinGlobalAgent: false },
       });
     }
-    expect(() => parseConfig({ ...base, backend: { type: "local", harnessBackend: "cloud" } })).toThrow();
-    expect(() => parseConfig({ ...base, backend: { type: "cloud", harnessBackend: "api" } })).toThrow();
+    expect(() => parseApplicationConfig({ ...base, backend: { type: "local", harnessBackend: "cloud" } })).toThrow();
+    expect(() => parseApplicationConfig({ ...base, backend: { type: "cloud", harnessBackend: "api" } })).toThrow();
   });
 
   test("Cloud execution selection is independent of agent identity", () => {
-    const config = parseConfig({ ...base, backend: {
+    const config = parseApplicationConfig({ ...base, backend: {
       type: "cloud", apiKeyEnv: "TEST_LETTA_KEY", computer: { deviceId: "device-test" },
-    }});
+    }}).bindings[0]!;
     expect(sdkOptions(config.backend, { TEST_LETTA_KEY: "test-only" })).toEqual({
       backend: "cloud", apiKey: "test-only", computer: { deviceId: "device-test" },
     });
@@ -251,26 +249,26 @@ describe("server configuration", () => {
       { ...base, backend: { type: "remote", url: "http://user:secret@example.com" } },
       { ...base, backend: { type: "cloud", apiKey: "secret" } },
       { ...base, backend: { type: "local", computer: "elsewhere" } },
-    ]) expect(() => parseConfig(input)).toThrow();
+    ]) expect(() => parseApplicationConfig(input)).toThrow();
   });
   test("remote App Server accepts WebSocket URLs and rejects A2A-only schemes", () => {
     for (const url of ["ws://127.0.0.1:4500", "wss://app.example/ws", "http://app.example", "https://app.example"]) {
-      expect(parseConfig({ ...base, backend: { type: "remote", url } }).backend).toEqual({ type: "remote", url });
+      expect(parseApplicationConfig({ ...base, backend: { type: "remote", url } }).bindings[0]?.backend).toEqual({ type: "remote", url });
     }
     for (const url of ["file:///tmp/x", "ws://user:pass@app.example"]) {
-      expect(() => parseConfig({ ...base, backend: { type: "remote", url } })).toThrow();
+      expect(() => parseApplicationConfig({ ...base, backend: { type: "remote", url } })).toThrow();
     }
   });
 
   test("advertises IPv4 loopback only while allowing Docker port mapping", () => {
     for (const hostname of ["[::1]", "localhost"]) {
-      expect(() => parseConfig({ ...base, publicUrl: `http://${hostname}:41241/` })).toThrow();
+      expect(() => parseApplicationConfig({ ...base, publicUrl: `http://${hostname}:41241/` })).toThrow();
     }
-    expect(parseConfig({ ...base, port: 41241, publicUrl: "http://127.0.0.1:4242/" }).publicUrl)
+    expect(parseApplicationConfig({ ...base, port: 41241, publicUrl: "http://127.0.0.1:4242/" }).publicUrl)
       .toBe("http://127.0.0.1:4242/");
   });
 
   test("single-agent configuration requires loopback URLs", () => {
-    expect(() => parseConfig({ ...base, publicUrl: "https://public.example" })).toThrow();
+    expect(() => parseApplicationConfig({ ...base, publicUrl: "https://public.example" })).toThrow();
   });
 });

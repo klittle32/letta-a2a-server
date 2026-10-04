@@ -8,7 +8,6 @@ import {
   type RequestContext,
 } from "@a2a-js/sdk/server";
 import { agentMessage, readText, textPart } from "./a2a-text.js";
-import { trustedCaller } from "./request-policy.js";
 import type { DurableBinding } from "./durable-binding.js";
 import {
   LettaTurnCancelledError,
@@ -133,13 +132,9 @@ export class LettaAgentExecutor implements AgentExecutor {
         const result = await this.letta.runTurn({
           taskId,
           a2aContextId: contextKey,
-          protocolContextId: contextId,
-          caller: trustedCaller(request.context),
           messageId: userMessage.messageId,
           text,
           signal: cancellation.signal,
-          // Assistant deltas are provisional, never public answer artifacts.
-          onAssistantText: () => progress("Generating response"),
           onActivity: progress,
         });
         if (this.letta.unresolvedContexts?.includes(contextKey))

@@ -36,7 +36,15 @@ For host-native execution, `config.local.json` must select an agent available to
 
 `npm run build` replaces generated `dist/` output so deleted source modules cannot linger in the artifact. Do not store configuration or state there.
 
-Server-only verification on October 4, 2026 used a fresh dependency directory in Linux arm64: `npm ci`, all 87 tests, compiler checks, build, and provider-free `--check` passed. Compiled output contained no outbound client or injected-tool surface; all three configuration samples parsed, and native Node SQLite reopen/identity checks passed. Installation still emitted upstream dependency warnings. No live backend trial or persistent-service restart was performed for this change.
+Server-only verification at `9b24790` on October 4, 2026 used a fresh dependency directory in Linux arm64: `npm ci`, all 87 tests, compiler checks, build, and provider-free `--check` passed. Compiled output contained no outbound client or injected-tool surface; all three configuration samples parsed, and native Node SQLite reopen/identity checks passed. Installation still emitted upstream dependency warnings. No live backend trial or persistent-service restart was performed for that change.
+
+## Runtime structure
+
+Single-agent and named-binding JSON normalize into one application configuration and startup path. Application tests and smoke fixtures use that same path rather than a separate single-agent server. SDK clients created through the application factory are application-owned; a live fixture keeps its management client separate for provisioning and cleanup. Lower-level protocol tests can still exercise the bridge directly.
+
+The turn runner borrows its SDK client and owns each SDK session through asynchronous disposal. It uses ordinary session options and safe activity updates, without a second tool-resource lifecycle or provisional-text callback. Disposal must settle before publishing an answer or recording eligible final text. The durable execution hooks, context locks, and uncertain-execution guards remain separate and necessary.
+
+The subsequent simplification was verified on October 4, 2026 in the cached Linux arm64 development image, with current source/tests/scripts mounted read-only and networking disabled: 89 tests / 432 assertions, `npm run check -- --noUnusedLocals --noUnusedParameters`, build, and provider-free smoke all passed. The smoke completed three fake SDK turns with zero agent creations or model calls. Regression coverage includes disposal-before-publication, the durable pre-session guard, and distinct owner-scoped conversations for identical wire context IDs. Independent review left no outstanding findings. This is source-level verification, not a new live-backend or installed-package proof; persistent services and the shared image were unchanged.
 
 ## Opt-in live fixtures
 
